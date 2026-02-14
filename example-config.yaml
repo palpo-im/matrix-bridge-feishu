@@ -1,0 +1,134 @@
+# Matrix-Feishu Bridge Configuration
+
+# Homeserver configuration
+homeserver:
+  # The address of your homeserver
+  address: "http://localhost:8008"
+  # The domain of your homeserver
+  domain: "localhost"
+  # The type of homeserver software (standard, synapse, conduit, dendrite)
+  software: "standard"
+  # Optional: Status endpoint for health checks
+  status_endpoint: null
+  # Optional: Message send checkpoint endpoint
+  message_send_checkpoint_endpoint: null
+  # Enable async media uploads
+  async_media: false
+  # Enable websocket support
+  websocket: false
+  # Ping interval in seconds
+  ping_interval_seconds: 0
+
+# Appservice configuration
+appservice:
+  # The address where the appservice will listen
+  address: "http://localhost:8080"
+  # The hostname where the appservice will listen
+  hostname: "0.0.0.0"
+  # The port where the appservice will listen
+  port: 8080
+  # Database configuration
+  database:
+    # Database type (postgres, sqlite)
+    type: "sqlite"
+    # Database connection URI
+    uri: "sqlite:matrix-feishu.db"
+    # Maximum open connections
+    max_open_conns: 20
+    # Maximum idle connections
+    max_idle_conns: 2
+    # Maximum connection idle time
+    max_conn_idle_time: null
+    # Maximum connection lifetime
+    max_conn_lifetime: null
+  # Appservice ID
+  id: "feishu"
+  # Bot configuration
+  bot:
+    username: "feishubot"
+    displayname: "Feishu Bridge"
+    avatar: "mxc://localhost/feishu-avatar"
+  # Enable ephemeral events
+  ephemeral_events: false
+  # Enable async transactions
+  async_transactions: false
+  # Appservice token
+  as_token: "your_as_token_here"
+  # Homeserver token
+  hs_token: "your_hs_token_here"
+
+# Bridge configuration
+bridge:
+  # The address where Feishu webhooks will be received
+  listen_address: "http://localhost:8081"
+  # The secret for validating Feishu webhooks
+  listen_secret: "your_webhook_secret_here"
+  # Feishu app credentials
+  app_id: "your_feishu_app_id"
+  app_secret: "your_feishu_app_secret"
+  # Optional: Feishu encrypt key
+  encrypt_key: null
+  # Optional: Feishu verification token
+  verification_token: null
+  # Username template for bridged users
+  username_template: "feishu_{{.}}"
+  # Displayname template for bridged users
+  displayname_template: "{{.}} (Feishu)"
+  # Avatar URL template for bridged users
+  avatar_template: ""
+  # Bridge Matrix replies
+  bridge_matrix_reply: true
+  # Bridge Matrix edits
+  bridge_matrix_edit: true
+  # Bridge Matrix reactions
+  bridge_matrix_reactions: true
+  # Bridge Matrix redactions
+  bridge_matrix_redactions: true
+  # Bridge Matrix leaves
+  bridge_matrix_leave: true
+  # Bridge Feishu joins
+  bridge_feishu_join: true
+  # Bridge Feishu leaves
+  bridge_feishu_leave: true
+  # Allow plain text messages
+  allow_plain_text: true
+  # Allow markdown messages
+  allow_markdown: true
+  # Allow HTML messages
+  allow_html: false
+  # Allow images
+  allow_images: true
+  # Allow videos
+  allow_videos: true
+  # Allow audio
+  allow_audio: true
+  # Allow files
+  allow_files: true
+  # Maximum media size in bytes
+  max_media_size: 10485760  # 10MB
+  # Message limit per minute
+  message_limit: 60
+  # Message cooldown in milliseconds
+  message_cooldown: 1000
+  # Webhook timeout in seconds
+  webhook_timeout: 30
+  # Feishu API timeout in seconds
+  api_timeout: 60
+  # Enable Feishu rich text formatting
+  enable_rich_text: true
+  # Convert Feishu cards to Matrix
+  convert_cards: true
+  # Permissions
+  permissions:
+    "*": "relay"
+    "localhost": "full"
+    "@admin:localhost": "admin"
+
+# Logging configuration
+logging:
+  # Minimum log level (trace, debug, info, warn, error)
+  min_level: "info"
+  # Log writers
+  writers:
+    - type: "stdout"
+      format: "pretty"

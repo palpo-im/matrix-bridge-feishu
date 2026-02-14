@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  matrix-appservice-feishu:
+    build: .
+    container_name: matrix-appservice-feishu
+    ports:
+      - "8080:8080"  # Matrix appservice API
+      - "8081:8081"  # Feishu webhook
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - matrix
+
+  # Optional: PostgreSQL for production
+  postgres:
+    image: postgres:15-alpine
+    container_name: matrix-appservice-feishu-db
+    environment:
+      POSTGRES_DB: matrix_feishu
+      POSTGRES_USER: matrix
+      POSTGRES_PASSWORD: your_password_here
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - matrix
+    profiles:
+      - postgres
+
+networks:
+  matrix:
+    driver: bridge
+
+volumes:
+  postgres_data:
