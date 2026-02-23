@@ -1,10 +1,3 @@
-pub mod uid;
-pub mod contact;
-
-pub use uid::*;
-pub use contact::*;
-
-use anyhow::Result;
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -28,32 +21,32 @@ impl UidGenerator {
 
         let sanitized = self.sanitize_username(feishu_id);
         let final_id = format!("feishu_{}", sanitized);
-        
+
         self.cache.insert(feishu_id.to_string(), final_id.clone());
-        
+
         format!("@{}:{}", final_id, domain)
     }
 
     fn sanitize_username(&self, username: &str) -> String {
         let sanitized = self.regex.replace_all(username, "_");
         let mut result = sanitized.to_string();
-        
+
         result = result.trim_matches('_').trim_matches('.').to_string();
-        
+
         if let Some(first_char) = result.chars().next() {
             if first_char.is_numeric() {
                 result = format!("user_{}", result);
             }
         }
-        
+
         if result.len() > 64 {
             result.truncate(64);
         }
-        
+
         if result.is_empty() {
             result = "unknown".to_string();
         }
-        
+
         result
     }
 

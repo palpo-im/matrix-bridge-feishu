@@ -1,6 +1,5 @@
 use crate::bridge::message::{BridgeMessage, MessageType};
 use crate::feishu::types::FeishuMessage;
-use serde_json::json;
 
 pub fn format_feishu_to_matrix(message: FeishuMessage) -> BridgeMessage {
     let (content, msg_type, attachments) = match message.msg_type.as_str() {

@@ -1,15 +1,6 @@
-pub mod message;
-pub mod puppet;
-pub mod portal;
-pub mod user;
-
-use message::*;
-use puppet::*;
-use portal::*;
-use user::*;
-use sqlx::{migrate::MigrateDatabase, Row, SqlitePool};
 use anyhow::Result;
-use tracing::{info, error};
+use sqlx::{migrate::MigrateDatabase, SqlitePool};
+use tracing::info;
 
 pub struct Database {
     pool: SqlitePool,
@@ -17,16 +8,28 @@ pub struct Database {
 }
 
 impl Database {
-    pub async fn connect(db_type: &str, db_uri: &str, _max_open: u32, _max_idle: u32) -> Result<Self> {
+    pub async fn connect(
+        db_type: &str,
+        db_uri: &str,
+        _max_open: u32,
+        _max_idle: u32,
+    ) -> Result<Self> {
         info!("Connecting to {} database: {}", db_type, db_uri);
-        
+
+        if !db_type.eq_ignore_ascii_case("sqlite") {
+            anyhow::bail!(
+                "database type '{}' is not supported yet; use sqlite",
+                db_type
+            );
+        }
+
         if !sqlx::Sqlite::database_exists(db_uri).await? {
             sqlx::Sqlite::create_database(db_uri).await?;
             info!("Created new {} database", db_type);
         }
-        
+
         let pool = SqlitePool::connect(db_uri).await?;
-        
+
         Ok(Self {
             pool,
             db_type: db_type.to_string(),
@@ -35,7 +38,7 @@ impl Database {
 
     pub async fn run_migrations(&self) -> Result<()> {
         info!("Running database migrations");
-        
+
         // Create tables similar to DingTalk bridge
         sqlx::query(
             r#"

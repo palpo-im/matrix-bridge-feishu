@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgePortal {
@@ -35,6 +36,7 @@ pub struct BridgeInfo {
 
 impl BridgePortal {
     pub fn new(feishu_room_id: String, mxid: String, name: String, creator_mxid: String) -> Self {
+        let creator = creator_mxid.clone();
         Self {
             id: None,
             feishu_room_id,
@@ -48,7 +50,7 @@ impl BridgePortal {
             creator_mxid,
             bridge_info: BridgeInfo {
                 bridgebot: "@feishubot:localhost".to_string(),
-                creator: creator_mxid.clone(),
+                creator,
                 protocol: "feishu".to_string(),
                 channel: HashMap::new(),
             },
@@ -57,13 +59,21 @@ impl BridgePortal {
         }
     }
 
-    pub async fn handle_feishu_message(&self, message: super::message::BridgeMessage) -> Result<()> {
-        // TODO: Convert and send message to Matrix
+    pub fn handle_feishu_message(&self, message: super::message::BridgeMessage) -> Result<()> {
+        let matrix_text = crate::formatter::convert_feishu_content_to_matrix_html(&message.content);
+        info!(
+            "Portal {} handled Feishu->Matrix message {}: {}",
+            self.mxid, message.id, matrix_text
+        );
         Ok(())
     }
 
-    pub async fn handle_matrix_message(&self, message: super::message::BridgeMessage) -> Result<()> {
-        // TODO: Convert and send message to Feishu
+    pub fn handle_matrix_message(&self, message: super::message::BridgeMessage) -> Result<()> {
+        let feishu_text = crate::formatter::format_matrix_to_feishu(message.clone())?;
+        info!(
+            "Portal {} handled Matrix->Feishu message {}: {}",
+            self.mxid, message.id, feishu_text
+        );
         Ok(())
     }
 }

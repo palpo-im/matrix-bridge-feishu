@@ -47,7 +47,7 @@ pub fn convert_matrix_text_to_feishu(content: &str) -> String {
         .replace("**", "*")
         .replace("__", "*")
         // Convert mentions (@user:domain.com -> @user)
-        .replace(|c| c == ':', "");
+        .replace(':', "");
 
     // Extract mentions and convert them to Feishu format
     extract_matrix_mentions(&converted)

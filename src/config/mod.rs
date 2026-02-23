@@ -4,7 +4,6 @@ pub use bridge::*;
 
 use anyhow::Result;
 use serde::Deserialize;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HomeserverConfig {
@@ -40,7 +39,7 @@ pub struct DatabaseConfig {
 }
 
 fn default_db_type() -> String {
-    "postgres".to_string()
+    "sqlite".to_string()
 }
 
 fn default_max_open_conns() -> u32 {
@@ -120,9 +119,10 @@ impl Config {
         let has_wildcard = self.bridge.permissions.contains_key("*");
         let has_example_domain = self.bridge.permissions.contains_key("example.com");
         let has_example_user = self.bridge.permissions.contains_key("@admin:example.com");
-        
-        let example_count = has_wildcard as usize + has_example_domain as usize + has_example_user as usize;
-        
+
+        let example_count =
+            has_wildcard as usize + has_example_domain as usize + has_example_user as usize;
+
         if self.bridge.permissions.len() <= example_count {
             anyhow::bail!("bridge.permissions not configured");
         }

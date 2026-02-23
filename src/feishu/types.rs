@@ -170,8 +170,9 @@ pub struct FeishuChat {
     pub owner_id: String,
     pub chat_info: FeishuChatInfo,
     pub member_count: u32,
-    public: bool,
-    public_extra: FeishuPublicExtra,
+    #[serde(rename = "public")]
+    pub is_public: bool,
+    pub public_extra: FeishuPublicExtra,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

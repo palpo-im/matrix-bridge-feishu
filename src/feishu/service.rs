@@ -1,23 +1,38 @@
-use std::sync::Arc;
-use anyhow::Result;
-use tracing::{info, error, debug};
+use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
 use salvo::prelude::*;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
 
 use super::{FeishuClient, FeishuWebhookEvent};
+use crate::bridge::message::{BridgeMessage, MessageType};
 use crate::bridge::FeishuBridge;
-use crate::bridge::message::BridgeMessage;
 
+#[derive(Clone)]
 pub struct FeishuService {
-    client: FeishuClient,
+    client: Arc<Mutex<FeishuClient>>,
     listen_address: String,
     listen_secret: String,
 }
 
 impl FeishuService {
-    pub fn new(app_id: String, app_secret: String, listen_address: String, listen_secret: String, encrypt_key: Option<String>, verification_token: Option<String>) -> Self {
+    pub fn new(
+        app_id: String,
+        app_secret: String,
+        listen_address: String,
+        listen_secret: String,
+        encrypt_key: Option<String>,
+        verification_token: Option<String>,
+    ) -> Self {
         Self {
-            client: FeishuClient::new(app_id, app_secret, encrypt_key, verification_token),
+            client: Arc::new(Mutex::new(FeishuClient::new(
+                app_id,
+                app_secret,
+                encrypt_key,
+                verification_token,
+            ))),
             listen_address,
             listen_secret,
         }
@@ -25,194 +40,280 @@ impl FeishuService {
 
     pub async fn start(&self, bridge: FeishuBridge) -> Result<()> {
         info!("Starting Feishu service on {}", self.listen_address);
-        
-        // Create webhook router
+
         let webhook_router = self.create_webhook_router(bridge);
-        
         let (hostname, port) = self.parse_listen_address();
-        let acceptor = TcpListener::new(&format!("{}:{}", hostname, port)).bind().await;
-        
+        let acceptor = TcpListener::new(format!("{}:{}", hostname, port))
+            .bind()
+            .await;
+
         info!("Feishu webhook listening on {}:{}", hostname, port);
-        
         Server::new(acceptor).serve(webhook_router).await;
-        
+
         Ok(())
     }
 
     fn parse_listen_address(&self) -> (String, u16) {
-        let url = url::Url::parse(&self.listen_address).unwrap_or_else(|_| {
-            url::Url::parse(&format!("http://{}", self.listen_address)).unwrap()
-        });
-        
-        let hostname = url.host_str().unwrap_or("0.0.0.0").to_string();
-        let port = url.port().unwrap_or(8081);
-        
-        (hostname, port)
+        let candidate = if self.listen_address.contains("://") {
+            self.listen_address.clone()
+        } else {
+            format!("http://{}", self.listen_address)
+        };
+
+        match url::Url::parse(&candidate) {
+            Ok(url) => {
+                let hostname = url.host_str().unwrap_or("0.0.0.0").to_string();
+                let port = url.port().unwrap_or(8081);
+                (hostname, port)
+            }
+            Err(_) => ("0.0.0.0".to_string(), 8081),
+        }
     }
 
     fn create_webhook_router(&self, bridge: FeishuBridge) -> Router {
-        let client = self.client.clone();
-        let secret = self.listen_secret.clone();
-        
+        let handler = FeishuWebhookHandler {
+            service: self.clone(),
+            bridge,
+        };
+
         Router::new()
             .hoop(Logger::new())
-            .hoop(Cors::new())
-            .push(
-                Router::with_path("/webhook")
-                    .method(Method::Post)
-                    .handle(move |req: &mut Request, res: &mut Response| {
-                        let bridge = bridge.clone();
-                        let client = client.clone();
-                        let secret = secret.clone();
-                        async move {
-                            Self::handle_webhook(req, res, bridge, client, secret).await
-                        }
-                    })
-            )
-            .push(
-                Router::with_path("/health")
-                    .handle(|_res: &mut Response| async {
-                        "OK"
-                    })
-            )
+            .push(Router::with_path("/webhook").post(handler))
+            .push(Router::with_path("/health").get(feishu_health))
     }
 
     async fn handle_webhook(
+        &self,
         req: &mut Request,
         res: &mut Response,
         bridge: FeishuBridge,
-        _client: FeishuClient,
-        secret: String,
-    ) {
+    ) -> Result<()> {
         debug!("Received Feishu webhook request");
-        
-        // Get headers
+
+        let body_bytes = req
+            .payload()
+            .await
+            .context("failed to read webhook request body")?;
+        let body_str =
+            String::from_utf8(body_bytes.to_vec()).context("webhook payload is not valid UTF-8")?;
+
+        self.verify_request_signature(req, &body_str, res).await?;
+        if res.status_code == Some(StatusCode::UNAUTHORIZED) {
+            return Ok(());
+        }
+
+        let mut payload: Value =
+            serde_json::from_str(&body_str).context("failed to parse webhook payload as JSON")?;
+
+        if let Some(encrypt) = payload.get("encrypt").and_then(Value::as_str) {
+            let decrypted = {
+                let client = self.client.lock().await;
+                client.decrypt_webhook_content(encrypt)?
+            };
+            payload = serde_json::from_str(&decrypted)
+                .context("failed to parse decrypted webhook payload as JSON")?;
+        }
+
+        if payload.get("type").and_then(Value::as_str) == Some("url_verification") {
+            let token = payload.get("token").and_then(Value::as_str);
+            let challenge = payload
+                .get("challenge")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let verified = {
+                let client = self.client.lock().await;
+                client.verify_verification_token(token)
+            };
+
+            if !verified {
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render("invalid verification token");
+                return Ok(());
+            }
+
+            res.status_code(StatusCode::OK);
+            res.render(json!({ "challenge": challenge }).to_string());
+            return Ok(());
+        }
+
+        let event: FeishuWebhookEvent =
+            serde_json::from_value(payload).context("failed to parse webhook event body")?;
+        info!("Received Feishu event: {}", event.header.event_type);
+
+        if event.header.event_type != "message.receive_v1" {
+            debug!(
+                "Ignoring unsupported Feishu event type: {}",
+                event.header.event_type
+            );
+            res.status_code(StatusCode::OK);
+            res.render("ignored");
+            return Ok(());
+        }
+
+        let bridge_message = self.webhook_event_to_bridge_message(event)?;
+        bridge.handle_feishu_message(bridge_message).await?;
+
+        res.status_code(StatusCode::OK);
+        res.render("success");
+        Ok(())
+    }
+
+    async fn verify_request_signature(
+        &self,
+        req: &Request,
+        body: &str,
+        res: &mut Response,
+    ) -> Result<()> {
+        if self.listen_secret.is_empty() {
+            return Ok(());
+        }
+
         let timestamp = req.header::<String>("X-Lark-Request-Timestamp");
         let nonce = req.header::<String>("X-Lark-Request-Nonce");
         let signature = req.header::<String>("X-Lark-Signature");
-        
-        // Get request body
-        let body_bytes = req.payload().await.unwrap_or_default();
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        
-        // Verify signature
-        if let (Some(timestamp), Some(nonce), Some(signature)) = (timestamp, nonce, signature) {
-            // TODO: Implement signature verification
-            // if !_client.verify_webhook_signature(&timestamp, &nonce, &body_str)? {
-            //     res.status_code(StatusCode::UNAUTHORIZED);
-            //     return;
-            // }
-        }
-        
-        // Parse webhook event
-        match serde_json::from_str::<FeishuWebhookEvent>(&body_str) {
-            Ok(event) => {
-                info!("Received Feishu event: {} from {}", event.header.event_type, event.event.sender.sender_id.user_id);
-                
-                // Convert to bridge message
-                let bridge_message = self.webhook_event_to_bridge_message(event).await;
-                
-                if let Ok(message) = bridge_message {
-                    // Handle the message through the bridge
-                    if let Err(e) = bridge.handle_feishu_message(message).await {
-                        error!("Failed to handle Feishu message: {}", e);
-                        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to parse Feishu webhook event: {}", e);
-                res.status_code(StatusCode::BAD_REQUEST);
-                return;
-            }
-        }
-        
-        res.status_code(StatusCode::OK);
-        res.render("success");
-    }
 
-    async fn webhook_event_to_bridge_message(&self, event: FeishuWebhookEvent) -> Result<BridgeMessage> {
-        match event.header.event_type.as_str() {
-            "message.receive_v1" => {
-                if let Some(message) = event.event.message {
-                    let content = match message.msg_type.as_str() {
-                        "text" => {
-                            let content_json: Value = serde_json::from_str(&message.content.to_string())?;
-                            content_json.get("text")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string()
-                        }
-                        "rich_text" => {
-                            // Extract text from rich text content
-                            "[Rich Text]".to_string()
-                        }
-                        "image" => {
-                            "[Image]".to_string()
-                        }
-                        "file" => {
-                            "[File]".to_string()
-                        }
-                        "audio" => {
-                            "[Audio]".to_string()
-                        }
-                        "video" => {
-                            "[Video]".to_string()
-                        }
-                        "card" => {
-                            "[Card]".to_string()
-                        }
-                        _ => {
-                            format!("[Unsupported: {}]", message.msg_type)
-                        }
-                    };
-                    
-                    let message = BridgeMessage::new_text(
-                        message.chat_id,
-                        event.event.sender.sender_id.user_id,
-                        content,
-                    );
-                    
-                    Ok(message)
-                } else {
-                    Err(anyhow::anyhow!("No message in event"))
-                }
-            }
+        let (timestamp, nonce, signature) = match (timestamp, nonce, signature) {
+            (Some(timestamp), Some(nonce), Some(signature)) => (timestamp, nonce, signature),
             _ => {
-                Err(anyhow::anyhow!("Unsupported event type: {}", event.header.event_type))
+                warn!("Webhook signature headers missing while listen_secret is configured");
+                res.status_code(StatusCode::UNAUTHORIZED);
+                res.render("missing signature");
+                return Ok(());
             }
+        };
+
+        let valid_signature = {
+            let client = self.client.lock().await;
+            client.verify_webhook_signature(
+                &self.listen_secret,
+                &timestamp,
+                &nonce,
+                body,
+                &signature,
+            )?
+        };
+
+        if !valid_signature {
+            warn!("Webhook signature verification failed");
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render("invalid signature");
         }
+
+        Ok(())
     }
 
-    pub async fn get_user(&mut self, user_id: &str) -> Result<super::FeishuUser> {
-        self.client.get_user(user_id).await
+    fn webhook_event_to_bridge_message(&self, event: FeishuWebhookEvent) -> Result<BridgeMessage> {
+        let message = event
+            .event
+            .message
+            .ok_or_else(|| anyhow::anyhow!("No message content in webhook event"))?;
+
+        let (content, msg_type) = match message.msg_type.as_str() {
+            "text" => (
+                message
+                    .content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                MessageType::Text,
+            ),
+            "post" | "rich_text" => ("[Rich Text]".to_string(), MessageType::RichText),
+            "image" => ("[Image]".to_string(), MessageType::Image),
+            "file" => ("[File]".to_string(), MessageType::File),
+            "audio" => ("[Audio]".to_string(), MessageType::Audio),
+            "video" => ("[Video]".to_string(), MessageType::Video),
+            "interactive" | "card" => ("[Card]".to_string(), MessageType::Card),
+            other => (format!("[Unsupported: {}]", other), MessageType::Text),
+        };
+
+        let timestamp = parse_event_timestamp(&message.create_time);
+        Ok(BridgeMessage {
+            id: message.message_id,
+            sender: event.event.sender.sender_id.user_id,
+            room_id: message.chat_id,
+            content,
+            msg_type,
+            timestamp,
+            attachments: vec![],
+        })
     }
 
-    pub async fn send_text_message(&mut self, chat_id: &str, content: &str) -> Result<String> {
-        self.client.send_text_message(chat_id, content).await
+    pub async fn get_user(&self, user_id: &str) -> Result<super::FeishuUser> {
+        let mut client = self.client.lock().await;
+        client.get_user(user_id).await
     }
 
-    pub async fn send_rich_text_message(&mut self, chat_id: &str, rich_text: &super::FeishuRichText) -> Result<String> {
-        self.client.send_rich_text_message(chat_id, rich_text).await
+    pub async fn send_text_message(&self, chat_id: &str, content: &str) -> Result<String> {
+        let mut client = self.client.lock().await;
+        client.send_text_message(chat_id, content).await
     }
 
-    pub async fn upload_image(&mut self, image_data: Vec<u8>, image_type: &str) -> Result<String> {
-        self.client.upload_image(image_data, image_type).await
+    pub async fn send_rich_text_message(
+        &self,
+        chat_id: &str,
+        rich_text: &super::FeishuRichText,
+    ) -> Result<String> {
+        let mut client = self.client.lock().await;
+        client.send_rich_text_message(chat_id, rich_text).await
+    }
+
+    pub async fn upload_image(&self, image_data: Vec<u8>, image_type: &str) -> Result<String> {
+        let mut client = self.client.lock().await;
+        client.upload_image(image_data, image_type).await
     }
 }
 
-impl Clone for FeishuService {
-    fn clone(&self) -> Self {
-        Self {
-            client: FeishuClient::new(
-                self.client.app_id.clone(),
-                self.client.app_secret.clone(),
-                self.client.encrypt_key.clone(),
-                self.client.verification_token.clone(),
-            ),
-            listen_address: self.listen_address.clone(),
-            listen_secret: self.listen_secret.clone(),
+fn parse_event_timestamp(value: &str) -> chrono::DateTime<Utc> {
+    if let Ok(epoch) = value.parse::<i64>() {
+        if epoch > 10_000_000_000 {
+            return Utc
+                .timestamp_millis_opt(epoch)
+                .single()
+                .unwrap_or_else(Utc::now);
+        }
+        return Utc
+            .timestamp_opt(epoch, 0)
+            .single()
+            .unwrap_or_else(Utc::now);
+    }
+
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(value) {
+        return parsed.with_timezone(&Utc);
+    }
+
+    Utc::now()
+}
+
+struct FeishuWebhookHandler {
+    service: FeishuService,
+    bridge: FeishuBridge,
+}
+
+#[async_trait]
+impl Handler for FeishuWebhookHandler {
+    async fn handle(
+        &self,
+        req: &mut Request,
+        _depot: &mut Depot,
+        res: &mut Response,
+        _ctrl: &mut FlowCtrl,
+    ) {
+        if let Err(err) = self
+            .service
+            .handle_webhook(req, res, self.bridge.clone())
+            .await
+        {
+            error!("Feishu webhook processing failed: {}", err);
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render("internal error");
         }
     }
+}
+
+#[handler]
+async fn feishu_health(res: &mut Response) {
+    res.status_code(StatusCode::OK);
+    res.render("OK");
 }

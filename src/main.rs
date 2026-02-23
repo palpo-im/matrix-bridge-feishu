@@ -1,18 +1,9 @@
 use clap::Parser;
+use matrix_appservice_feishu::{bridge::FeishuBridge, config::Config};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, error, Level};
+use tracing::{error, info, Level};
 use tracing_subscriber::FmtSubscriber;
-
-mod config;
-mod database;
-mod feishu;
-mod bridge;
-mod formatter;
-mod util;
-
-use config::Config;
-use bridge::FeishuBridge;
 
 #[derive(Parser, Debug)]
 #[command(name = "matrix-appservice-feishu")]
@@ -33,22 +24,25 @@ const EXAMPLE_CONFIG: &str = include_str!("../example-config.yaml");
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    
+
     if args.generate_config {
         println!("{}", EXAMPLE_CONFIG);
         return Ok(());
     }
 
-    let subscriber = FmtSubscriber::builder()
+    FmtSubscriber::builder()
         .with_max_level(Level::DEBUG)
         .pretty()
         .init();
-    
-    info!("Starting Matrix-Feishu bridge v{}", env!("CARGO_PKG_VERSION"));
-    
+
+    info!(
+        "Starting Matrix-Feishu bridge v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+
     let config_path = args.config.to_string_lossy();
     info!("Loading config from {}", config_path);
-    
+
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -56,10 +50,10 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    
+
     let bridge = FeishuBridge::new(config).await?;
     let bridge = Arc::new(bridge);
-    
+
     let bridge_clone = bridge.clone();
     tokio::select! {
         _ = bridge_clone.start() => {
@@ -69,9 +63,9 @@ async fn main() -> anyhow::Result<()> {
             info!("Received shutdown signal");
         }
     }
-    
+
     bridge.stop().await;
     info!("Bridge stopped");
-    
+
     Ok(())
 }

@@ -1,6 +1,5 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeUser {
@@ -46,12 +45,19 @@ impl BridgeUser {
     }
 
     pub async fn login_feishu(&mut self, user_id: String, token: String) -> Result<()> {
+        if user_id.trim().is_empty() {
+            self.connection_state = ConnectionState::Error;
+            anyhow::bail!("feishu user_id cannot be empty");
+        }
+        if token.trim().len() < 8 {
+            self.connection_state = ConnectionState::Error;
+            anyhow::bail!("feishu token looks invalid");
+        }
+
         self.feishu_user_id = Some(user_id);
         self.feishu_token = Some(token);
         self.connection_state = ConnectionState::Connecting;
-        
-        // TODO: Verify Feishu credentials
-        
+
         self.connection_state = ConnectionState::Connected;
         Ok(())
     }

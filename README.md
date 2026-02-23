@@ -2,6 +2,9 @@
 
 A Matrix bridge for Feishu (飞书), built with Rust and the Salvo web framework.
 
+- English: `README.md`
+- 中文说明: `README.zh-CN.md`
+
 ## Features
 
 - **Bidirectional messaging** between Matrix and Feishu
