@@ -4,7 +4,7 @@ FROM rust:1.93 as builder
 WORKDIR /app
 
 # Copy cargo files
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock example-config.yaml ./
 
 # Create dummy main.rs to cache dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
