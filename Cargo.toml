@@ -10,11 +10,12 @@ repository = "https://github.com/palpo-im/matrix-appservice-feishu"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-salvo = { version = "0.73", default-features = false, features = ["server", "http1", "logging", "cors"] }
+salvo = { version = "0.89.1", default-features = false, features = ["server", "http1", "logging", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid", "migrate"] }
+diesel = { version = "2.3.6", default-features = false, features = ["sqlite", "postgres", "r2d2", "chrono", "uuid"] }
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
@@ -22,7 +23,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 regex = { version = "1", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "multipart"] }
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"

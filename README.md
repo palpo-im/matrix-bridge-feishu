@@ -23,7 +23,7 @@ The bridge is built with a modular architecture:
 
 - **Bridge Core**: Main application logic and state management
 - **Feishu Integration**: Feishu API client and webhook handling
-- **Database Layer**: SQLx-based data persistence
+- **Database Layer**: Diesel-based data persistence
 - **Message Formatting**: Conversion between Feishu and Matrix formats
 - **Web Services**: Salvo-based HTTP endpoints
 
@@ -129,7 +129,7 @@ export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="postgresql://..."
 
 ## Database
 
-The bridge uses SQLx for database operations with support for:
+The bridge uses Diesel for database operations with support for:
 
 - **SQLite**: For small deployments
 - **PostgreSQL**: For production use
@@ -344,5 +344,5 @@ This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE)
 
 - Inspired by matrix-appservice-discord and matrix-appservice-wechat
 - Built with Salvo web framework
-- Uses SQLx for database operations
+- Uses Diesel for database operations
 - Feishu Open Platform API documentation
