@@ -1617,34 +1617,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-appservice-feishu"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "clap",
- "diesel",
- "hex",
- "hmac",
- "libsqlite3-sys",
- "matrix-bot-sdk",
- "regex",
- "reqwest 0.13.2",
- "salvo",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "matrix-bot-sdk"
 version = "0.2.1"
 dependencies = [
@@ -1675,6 +1647,34 @@ dependencies = [
  "url",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "matrix-bridge-feishu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "clap",
+ "diesel",
+ "hex",
+ "hmac",
+ "libsqlite3-sys",
+ "matrix-bot-sdk",
+ "regex",
+ "reqwest 0.13.2",
+ "salvo",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]

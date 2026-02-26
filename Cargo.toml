@@ -1,12 +1,12 @@
 [package]
-name = "matrix-appservice-feishu"
+name = "matrix-bridge-feishu"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Matrix Feishu Bridge Contributors"]
 description = "A Matrix-Feishu puppeting bridge"
 license = "Apache-2.0"
-repository = "https://github.com/palpo-im/matrix-appservice-feishu"
+repository = "https://github.com/palpo-im/matrix-bridge-feishu"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -52,5 +52,5 @@ strip = true
 opt-level = 3
 
 [[bin]]
-name = "matrix-appservice-feishu"
+name = "matrix-bridge-feishu"
 path = "src/main.rs"
