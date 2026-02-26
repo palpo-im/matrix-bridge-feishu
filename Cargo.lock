@@ -1618,7 +1618,9 @@ dependencies = [
 
 [[package]]
 name = "matrix-bot-sdk"
-version = "0.2.1"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "145342b7f0e35b819e4135b15ee99d67ca125539a13831ef59dc9b9a8ec07e54"
 dependencies = [
  "aes",
  "anyhow",

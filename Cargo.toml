@@ -44,7 +44,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 url = "2"
-matrix-bot-sdk = { path = "../matrix-bot-sdk" }
+matrix-bot-sdk = "0.2.0"
 
 [profile.release]
 lto = true
