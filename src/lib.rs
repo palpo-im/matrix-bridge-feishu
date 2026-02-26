@@ -4,3 +4,4 @@ pub mod database;
 pub mod feishu;
 pub mod formatter;
 pub mod util;
+pub mod web;

@@ -1,0 +1,177 @@
+use std::sync::Arc;
+
+use salvo::oapi::extract::JsonBody;
+use salvo::prelude::*;
+use salvo::affix_state;
+use serde::{Deserialize, Serialize};
+
+use crate::bridge::{PendingBridgeRequest, ProvisioningCoordinator};
+use crate::database::RoomStore;
+
+#[derive(Clone)]
+pub struct ProvisioningApi {
+    room_store: Arc<dyn RoomStore>,
+    provisioning: Arc<ProvisioningCoordinator>,
+}
+
+impl ProvisioningApi {
+    pub fn new(room_store: Arc<dyn RoomStore>, provisioning: Arc<ProvisioningCoordinator>) -> Self {
+        Self { room_store, provisioning }
+    }
+
+    pub fn router(self) -> Router {
+        Router::new()
+            .push(Router::with_path("/v1/bridge").post(create_bridge))
+            .push(Router::with_path("/v1/bridge/<room_id>").delete(delete_bridge))
+            .push(Router::with_path("/v1/bridges").get(list_bridges))
+            .push(Router::with_path("/v1/pending").get(list_pending))
+            .hoop(affix_state::inject(self))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BridgeRequest {
+    pub matrix_room_id: String,
+    pub feishu_chat_id: String,
+    pub requestor: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BridgeResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[handler]
+async fn create_bridge(
+    req: JsonBody<BridgeRequest>,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+
+    match api
+        .provisioning
+        .request_bridge(&req.feishu_chat_id, &req.matrix_room_id, &req.requestor)
+        .await
+    {
+        Ok(()) => {
+            res.status_code(StatusCode::CREATED);
+            res.render(Json(BridgeResponse {
+                success: true,
+                message: "Bridge request created".to_string(),
+            }));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(BridgeResponse {
+                success: false,
+                message: e.to_string(),
+            }));
+        }
+    }
+}
+
+#[handler]
+async fn delete_bridge(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let room_id = req.param::<String>("room_id").unwrap_or_default();
+
+    match api.room_store.get_room_by_matrix_id(&room_id).await {
+        Ok(Some(mapping)) => {
+            if let Err(e) = api.room_store.delete_room_mapping(mapping.id).await {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(BridgeResponse {
+                    success: false,
+                    message: format!("Failed to delete bridge: {}", e),
+                }));
+                return;
+            }
+            res.render(Json(BridgeResponse {
+                success: true,
+                message: "Bridge deleted".to_string(),
+            }));
+        }
+        Ok(None) => {
+            res.status_code(StatusCode::NOT_FOUND);
+            res.render(Json(BridgeResponse {
+                success: false,
+                message: "Bridge not found".to_string(),
+            }));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(BridgeResponse {
+                success: false,
+                message: format!("Database error: {}", e),
+            }));
+        }
+    }
+}
+
+#[handler]
+async fn list_bridges(depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+
+    match api.room_store.list_room_mappings(Some(100), None).await {
+        Ok(bridges) => {
+            res.render(Json(serde_json::json!({
+                "bridges": bridges,
+                "count": bridges.len()
+            })));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "error": e.to_string()
+            })));
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PendingResponse {
+    pending: Vec<PendingBridgeRequestJson>,
+    count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PendingBridgeRequestJson {
+    pub feishu_chat_id: String,
+    pub matrix_room_id: String,
+    pub matrix_requestor: String,
+    pub created_at: String,
+    pub status: String,
+}
+
+impl From<PendingBridgeRequest> for PendingBridgeRequestJson {
+    fn from(req: PendingBridgeRequest) -> Self {
+        Self {
+            feishu_chat_id: req.feishu_chat_id,
+            matrix_room_id: req.matrix_room_id,
+            matrix_requestor: req.matrix_requestor,
+            created_at: req.created_at.to_rfc3339(),
+            status: format!("{:?}", req.status),
+        }
+    }
+}
+
+#[handler]
+async fn list_pending(depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+
+    let pending: Vec<PendingBridgeRequestJson> = api
+        .provisioning
+        .get_pending_requests()
+        .await
+        .into_iter()
+        .map(|r| r.into())
+        .collect();
+    
+    let count = pending.len();
+    res.render(Json(PendingResponse { pending, count }));
+}

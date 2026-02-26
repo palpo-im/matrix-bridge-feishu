@@ -1,3 +1,12 @@
+pub mod error;
+pub mod models;
+pub mod stores;
+pub mod sqlite_stores;
+
+pub use error::{DatabaseError, DatabaseResult};
+pub use models::{MessageMapping, ProcessedEvent, RoomMapping, UserMapping};
+pub use stores::{EventStore, MessageStore, RoomStore, UserStore};
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -204,6 +213,54 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp INTEGER NOT NULL,
     attachments TEXT
 );
+
+CREATE TABLE IF NOT EXISTS room_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matrix_room_id TEXT NOT NULL UNIQUE,
+    feishu_chat_id TEXT NOT NULL UNIQUE,
+    feishu_chat_name TEXT,
+    feishu_chat_type TEXT NOT NULL DEFAULT 'group',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matrix_user_id TEXT NOT NULL UNIQUE,
+    feishu_user_id TEXT NOT NULL UNIQUE,
+    feishu_username TEXT,
+    feishu_avatar TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS message_mappings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    matrix_event_id TEXT NOT NULL UNIQUE,
+    feishu_message_id TEXT NOT NULL UNIQUE,
+    room_id TEXT NOT NULL,
+    sender_mxid TEXT NOT NULL,
+    sender_feishu_id TEXT NOT NULL,
+    content_hash TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS processed_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_mappings_matrix_id ON room_mappings(matrix_room_id);
+CREATE INDEX IF NOT EXISTS idx_room_mappings_feishu_id ON room_mappings(feishu_chat_id);
+CREATE INDEX IF NOT EXISTS idx_user_mappings_matrix_id ON user_mappings(matrix_user_id);
+CREATE INDEX IF NOT EXISTS idx_user_mappings_feishu_id ON user_mappings(feishu_user_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(matrix_event_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
+CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
 "#;
 
 const POSTGRES_MIGRATIONS: &str = r#"
@@ -264,4 +321,52 @@ CREATE TABLE IF NOT EXISTS messages (
     timestamp BIGINT NOT NULL,
     attachments TEXT
 );
+
+CREATE TABLE IF NOT EXISTS room_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    matrix_room_id TEXT NOT NULL UNIQUE,
+    feishu_chat_id TEXT NOT NULL UNIQUE,
+    feishu_chat_name TEXT,
+    feishu_chat_type TEXT NOT NULL DEFAULT 'group',
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS user_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    matrix_user_id TEXT NOT NULL UNIQUE,
+    feishu_user_id TEXT NOT NULL UNIQUE,
+    feishu_username TEXT,
+    feishu_avatar TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS message_mappings (
+    id BIGSERIAL PRIMARY KEY,
+    matrix_event_id TEXT NOT NULL UNIQUE,
+    feishu_message_id TEXT NOT NULL UNIQUE,
+    room_id TEXT NOT NULL,
+    sender_mxid TEXT NOT NULL,
+    sender_feishu_id TEXT NOT NULL,
+    content_hash TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS processed_events (
+    id BIGSERIAL PRIMARY KEY,
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_room_mappings_matrix_id ON room_mappings(matrix_room_id);
+CREATE INDEX IF NOT EXISTS idx_room_mappings_feishu_id ON room_mappings(feishu_chat_id);
+CREATE INDEX IF NOT EXISTS idx_user_mappings_matrix_id ON user_mappings(matrix_user_id);
+CREATE INDEX IF NOT EXISTS idx_user_mappings_feishu_id ON user_mappings(feishu_user_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(matrix_event_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
+CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
 "#;

@@ -3,39 +3,52 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use diesel::r2d2::{ConnectionManager, Pool};
+use diesel::sqlite::SqliteConnection;
 use matrix_bot_sdk::appservice::{Appservice, AppserviceHandler, Intent};
 use matrix_bot_sdk::client::{MatrixAuth, MatrixClient};
 use salvo::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 use super::message::{BridgeMessage, MessageType};
 use super::portal::BridgePortal;
 use super::puppet::BridgePuppet;
 use super::user::BridgeUser;
+use super::MatrixEvent;
+use crate::bridge::{MatrixCommandHandler, MatrixCommandOutcome, MatrixEventProcessor, MessageFlow, PresenceHandler, ProvisioningCoordinator};
 use crate::config::Config;
-use crate::database::Database;
+use crate::database::{Database, EventStore, RoomStore};
+use crate::database::sqlite_stores::SqliteStores;
 use crate::feishu::FeishuService;
 use crate::formatter;
 
+type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
+
 #[derive(Clone)]
 pub struct FeishuBridge {
-    pub config: Config,
+    pub config: Arc<Config>,
     pub db: Database,
     pub feishu_service: Arc<FeishuService>,
     pub appservice: Arc<Appservice>,
     pub bot_intent: Intent,
+    stores: SqliteStores,
     _users_by_mxid: Arc<RwLock<HashMap<String, BridgeUser>>>,
     portals_by_mxid: Arc<RwLock<HashMap<String, BridgePortal>>>,
     portals_by_feishu_room: Arc<RwLock<HashMap<String, String>>>,
     _puppets: Arc<RwLock<HashMap<String, BridgePuppet>>>,
     intents: Arc<RwLock<HashMap<String, Intent>>>,
+    command_handler: Arc<MatrixCommandHandler>,
+    provisioning: Arc<ProvisioningCoordinator>,
+    presence_handler: Arc<PresenceHandler>,
 }
 
 impl FeishuBridge {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
+        let config = Arc::new(config);
+        
         let db_type = &config.appservice.database.r#type;
         let db_uri = &config.appservice.database.uri;
         let max_open = config.appservice.database.max_open_conns;
@@ -43,6 +56,9 @@ impl FeishuBridge {
 
         let db = Database::connect(db_type, db_uri, max_open, max_idle).await?;
         db.run_migrations().await?;
+
+        let sqlite_pool = Self::create_sqlite_pool(db_type, db_uri, max_open, max_idle).await?;
+        let stores = SqliteStores::new(sqlite_pool);
 
         let feishu_service = Arc::new(FeishuService::new(
             config.bridge.app_id.clone(),
@@ -74,18 +90,50 @@ impl FeishuBridge {
 
         let bot_intent = Intent::new(&bot_mxid, appservice.client.clone());
 
+        let command_handler = Arc::new(MatrixCommandHandler::new(true));
+        let provisioning = Arc::new(ProvisioningCoordinator::new(config.bridge.webhook_timeout));
+        let presence_handler = Arc::new(PresenceHandler::new(Some(50)));
+
         Ok(Self {
             config,
             db,
             feishu_service,
             appservice: Arc::new(appservice),
             bot_intent,
+            stores,
             _users_by_mxid: Arc::new(RwLock::new(HashMap::new())),
             portals_by_mxid: Arc::new(RwLock::new(HashMap::new())),
             portals_by_feishu_room: Arc::new(RwLock::new(HashMap::new())),
             _puppets: Arc::new(RwLock::new(HashMap::new())),
             intents: Arc::new(RwLock::new(HashMap::new())),
+            command_handler,
+            provisioning,
+            presence_handler,
         })
+    }
+
+    async fn create_sqlite_pool(
+        db_type: &str,
+        db_uri: &str,
+        max_open: u32,
+        max_idle: u32,
+    ) -> anyhow::Result<SqlitePool> {
+        if db_type != "sqlite" {
+            anyhow::bail!("Only sqlite is currently supported for stores");
+        }
+
+        let db_path = db_uri
+            .strip_prefix("sqlite://")
+            .or_else(|| db_uri.strip_prefix("sqlite:"))
+            .unwrap_or(db_uri);
+
+        let manager = ConnectionManager::<SqliteConnection>::new(db_path);
+        let pool = Pool::builder()
+            .max_size(max_open.max(1))
+            .min_idle(Some(max_idle.min(max_open)))
+            .build(manager)?;
+
+        Ok(pool)
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
@@ -101,8 +149,21 @@ impl FeishuBridge {
             }
         });
 
+        let room_store = self.stores.room_store();
+        let event_store = self.stores.event_store();
+        let message_flow = Arc::new(MessageFlow::new(self.config.clone(), self.feishu_service.clone()));
+        
+        let event_processor = Arc::new(MatrixEventProcessor::new(
+            self.config.clone(),
+            self.feishu_service.clone(),
+            room_store,
+            event_store,
+            message_flow,
+        ));
+
         let handler = Arc::new(BridgeHandler {
             bridge: self.clone(),
+            event_processor,
         });
 
         let appservice_with_handler = Appservice::new(
@@ -114,7 +175,15 @@ impl FeishuBridge {
         .with_protocols(["feishu"])
         .with_handler(handler);
 
-        let router = appservice_with_handler.router();
+        let base_router = appservice_with_handler.router();
+
+        let health_router = Router::new()
+            .push(Router::with_path("/health").get(health_handler))
+            .push(Router::with_path("/ready").get(ready_handler));
+
+        let router = Router::new()
+            .push(base_router)
+            .push(health_router);
 
         let acceptor = TcpListener::new(format!(
             "{}:{}",
@@ -151,15 +220,39 @@ impl FeishuBridge {
         intent
     }
 
+    pub fn room_store(&self) -> Arc<dyn RoomStore> {
+        self.stores.room_store()
+    }
+
+    pub fn event_store(&self) -> Arc<dyn EventStore> {
+        self.stores.event_store()
+    }
+
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
         info!(
             "Handling Feishu message {} in room {}",
             message.id, message.room_id
         );
 
-        let portal = self
-            .get_or_create_portal_by_feishu_room(&message.room_id)
+        let room_mapping = self
+            .stores
+            .room_store()
+            .get_room_by_feishu_id(&message.room_id)
             .await?;
+
+        let portal = if let Some(mapping) = room_mapping {
+            BridgePortal::new(
+                message.room_id.clone(),
+                mapping.matrix_room_id.clone(),
+                mapping.feishu_chat_name.unwrap_or_else(|| message.room_id.clone()),
+                format!(
+                    "@{}:{}",
+                    self.config.appservice.bot.username, self.config.homeserver.domain
+                ),
+            )
+        } else {
+            self.get_or_create_portal_by_feishu_room(&message.room_id).await?
+        };
 
         let intent = self
             .get_or_create_intent(&portal.bridge_info.bridgebot)
@@ -174,6 +267,25 @@ impl FeishuBridge {
 
     pub async fn handle_matrix_message(&self, room_id: &str, event: Value) -> anyhow::Result<()> {
         info!("Handling Matrix message in room {}", room_id);
+
+        let body = event
+            .get("content")
+            .and_then(|c| c.get("body"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        if self.command_handler.is_command(body) {
+            debug!("Matrix command detected: {}", body);
+            let room_mapping: Option<crate::database::RoomMapping> = self
+                .stores
+                .room_store()
+                .get_room_by_matrix_id(room_id)
+                .await?;
+            
+            let outcome = self.command_handler.handle(body, room_mapping.is_some(), |_| true);
+            self.handle_command_outcome(outcome, room_id, event.get("sender").and_then(Value::as_str).unwrap_or("unknown")).await?;
+            return Ok(());
+        }
 
         let message = self.matrix_event_to_bridge_message(room_id, event)?;
         let portal = self.get_or_create_portal_by_matrix_room(room_id).await?;
@@ -191,6 +303,40 @@ impl FeishuBridge {
             .send_text_message(&portal.feishu_room_id, &feishu_content)
             .await?;
 
+        Ok(())
+    }
+
+    async fn handle_command_outcome(
+        &self,
+        outcome: MatrixCommandOutcome,
+        room_id: &str,
+        sender: &str,
+    ) -> anyhow::Result<()> {
+        match outcome {
+            MatrixCommandOutcome::Ignored => {}
+            MatrixCommandOutcome::Reply(reply) => {
+                self.bot_intent.send_text(room_id, &reply).await?;
+            }
+            MatrixCommandOutcome::BridgeRequested { feishu_chat_id } => {
+                let mapping = crate::database::RoomMapping::new(
+                    room_id.to_string(),
+                    feishu_chat_id.clone(),
+                    Some(format!("Feishu {}", feishu_chat_id)),
+                );
+                self.stores.room_store().create_room_mapping(&mapping).await?;
+                info!("Created bridge: {} <-> {}", room_id, feishu_chat_id);
+                self.bot_intent
+                    .send_text(room_id, &format!("Bridged to Feishu chat: {}", feishu_chat_id))
+                    .await?;
+            }
+            MatrixCommandOutcome::UnbridgeRequested => {
+                if let Some(mapping) = self.stores.room_store().get_room_by_matrix_id(room_id).await? {
+                    self.stores.room_store().delete_room_mapping(mapping.id).await?;
+                    info!("Removed bridge for room {}", room_id);
+                    self.bot_intent.send_text(room_id, "Bridge removed").await?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -334,8 +480,24 @@ fn sanitize_identifier(input: &str) -> String {
     }
 }
 
+#[handler]
+async fn health_handler(res: &mut Response) {
+    res.status_code(StatusCode::OK);
+    res.render(Json(serde_json::json!({
+        "status": "ok",
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    })));
+}
+
+#[handler]
+async fn ready_handler(res: &mut Response) {
+    res.status_code(StatusCode::OK);
+    res.render(Json(serde_json::json!({ "ready": true })));
+}
+
 struct BridgeHandler {
     bridge: FeishuBridge,
+    event_processor: Arc<MatrixEventProcessor>,
 }
 
 #[async_trait]
@@ -353,16 +515,27 @@ impl AppserviceHandler for BridgeHandler {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
 
-            if event_type != "m.room.message" {
-                continue;
-            }
+            let room_id = event
+                .get("room_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
 
-            let room_id = match event.get("room_id").and_then(Value::as_str) {
-                Some(room_id) => room_id.to_string(),
-                None => continue,
+            let sender = event
+                .get("sender")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            let matrix_event = MatrixEvent {
+                event_id: event.get("event_id").and_then(Value::as_str).map(ToOwned::to_owned),
+                event_type: event_type.to_string(),
+                room_id: room_id.to_string(),
+                sender: sender.to_string(),
+                state_key: event.get("state_key").and_then(Value::as_str).map(ToOwned::to_owned),
+                content: event.get("content").cloned(),
+                timestamp: event.get("origin_server_ts").map(|v| v.to_string()),
             };
 
-            if let Err(err) = self.bridge.handle_matrix_message(&room_id, event).await {
+            if let Err(err) = self.event_processor.process_event(matrix_event).await {
                 error!("Failed to process Matrix event in {}: {}", room_id, err);
             }
         }
