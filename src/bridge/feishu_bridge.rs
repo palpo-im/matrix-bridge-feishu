@@ -1,10 +1,14 @@
+use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
+use matrix_bot_sdk::appservice::{Appservice, AppserviceHandler, Intent};
+use matrix_bot_sdk::client::{MatrixAuth, MatrixClient};
 use salvo::prelude::*;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
+use url::Url;
 
 use crate::config::Config;
 use crate::database::Database;
@@ -19,10 +23,13 @@ pub struct FeishuBridge {
     pub config: Config,
     pub db: Database,
     pub feishu_service: Arc<FeishuService>,
+    pub appservice: Arc<Appservice>,
+    pub bot_intent: Intent,
     _users_by_mxid: Arc<RwLock<HashMap<String, BridgeUser>>>,
     portals_by_mxid: Arc<RwLock<HashMap<String, BridgePortal>>>,
     portals_by_feishu_room: Arc<RwLock<HashMap<String, String>>>,
     _puppets: Arc<RwLock<HashMap<String, BridgePuppet>>>,
+    intents: Arc<RwLock<HashMap<String, Intent>>>,
 }
 
 impl FeishuBridge {
@@ -44,19 +51,45 @@ impl FeishuBridge {
             config.bridge.verification_token.clone(),
         ));
 
+        let homeserver_url = Url::parse(&config.homeserver.address)?;
+        let bot_mxid = format!(
+            "@{}:{}",
+            config.appservice.bot.username, config.homeserver.domain
+        );
+
+        let client = MatrixClient::new(
+            homeserver_url,
+            MatrixAuth::new(&config.appservice.as_token).with_user_id(&bot_mxid),
+        );
+
+        let appservice = Appservice::new(
+            config.appservice.hs_token.clone(),
+            config.appservice.as_token.clone(),
+            client,
+        )
+        .with_appservice_id(&config.appservice.id)
+        .with_protocols(["feishu"]);
+
+        let bot_intent = Intent::new(&bot_mxid, appservice.client.clone());
+
         Ok(Self {
             config,
             db,
             feishu_service,
+            appservice: Arc::new(appservice),
+            bot_intent,
             _users_by_mxid: Arc::new(RwLock::new(HashMap::new())),
             portals_by_mxid: Arc::new(RwLock::new(HashMap::new())),
             portals_by_feishu_room: Arc::new(RwLock::new(HashMap::new())),
             _puppets: Arc::new(RwLock::new(HashMap::new())),
+            intents: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
     pub async fn start(&self) -> anyhow::Result<()> {
         info!("Starting Feishu bridge");
+
+        self.bot_intent.ensure_registered().await?;
 
         let service = self.feishu_service.clone();
         let bridge_clone = self.clone();
@@ -66,7 +99,21 @@ impl FeishuBridge {
             }
         });
 
-        let appservice_router = self.create_appservice_router();
+        let handler = Arc::new(BridgeHandler {
+            bridge: self.clone(),
+        });
+
+        let appservice_with_handler = Appservice::new(
+            self.config.appservice.hs_token.clone(),
+            self.config.appservice.as_token.clone(),
+            self.appservice.client.clone(),
+        )
+        .with_appservice_id(&self.config.appservice.id)
+        .with_protocols(["feishu"])
+        .with_handler(handler);
+
+        let router = appservice_with_handler.router();
+
         let acceptor = TcpListener::new(format!(
             "{}:{}",
             self.config.appservice.hostname, self.config.appservice.port
@@ -79,7 +126,7 @@ impl FeishuBridge {
             self.config.appservice.hostname, self.config.appservice.port
         );
 
-        Server::new(acceptor).serve(appservice_router).await;
+        Server::new(acceptor).serve(router).await;
         Ok(())
     }
 
@@ -87,107 +134,16 @@ impl FeishuBridge {
         info!("Stopping Feishu bridge");
     }
 
-    fn create_appservice_router(&self) -> Router {
-        let handler = MatrixRequestHandler {
-            bridge: self.clone(),
-        };
-
-        Router::new()
-            .hoop(Logger::new())
-            .push(Router::with_path("/_matrix/app/{*path}").put(handler))
-            .push(Router::with_path("/health").get(bridge_health))
-    }
-
-    async fn handle_matrix_request(&self, req: &mut Request, res: &mut Response) {
-        if !self.is_authorized_request(req).await {
-            res.status_code(StatusCode::UNAUTHORIZED);
-            res.render("unauthorized");
-            return;
+    pub async fn get_or_create_intent(&self, user_id: &str) -> Intent {
+        let intents = self.intents.read().await;
+        if let Some(intent) = intents.get(user_id) {
+            return intent.clone();
         }
+        drop(intents);
 
-        let path = req.uri().path().to_string();
-        let is_transaction = path.contains("/transactions/");
-        if !is_transaction {
-            res.status_code(StatusCode::OK);
-            res.render("{}");
-            return;
-        }
-
-        let payload = match req.payload().await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!("Failed to read appservice payload: {}", err);
-                res.status_code(StatusCode::BAD_REQUEST);
-                res.render("invalid payload");
-                return;
-            }
-        };
-
-        let body: Value = match serde_json::from_slice(payload) {
-            Ok(body) => body,
-            Err(err) => {
-                error!("Failed to parse appservice JSON body: {}", err);
-                res.status_code(StatusCode::BAD_REQUEST);
-                res.render("invalid json");
-                return;
-            }
-        };
-
-        let mut processed = 0usize;
-        let events = body
-            .get("events")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-
-        for event in events {
-            let event_type = event
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if event_type != "m.room.message" {
-                continue;
-            }
-
-            let room_id = match event.get("room_id").and_then(Value::as_str) {
-                Some(room_id) => room_id.to_string(),
-                None => continue,
-            };
-
-            if let Err(err) = self.handle_matrix_message(&room_id, event).await {
-                error!("Failed to process Matrix event in {}: {}", room_id, err);
-                continue;
-            }
-            processed += 1;
-        }
-
-        res.status_code(StatusCode::OK);
-        res.render(format!("{{\"processed\":{}}}", processed));
-    }
-
-    async fn is_authorized_request(&self, req: &Request) -> bool {
-        let tokens = [
-            &self.config.appservice.hs_token,
-            &self.config.appservice.as_token,
-        ];
-
-        if let Some(query_token) = req.query::<String>("access_token") {
-            if tokens.iter().any(|token| query_token == **token) {
-                return true;
-            }
-        }
-
-        if let Some(auth) = req.header::<String>("Authorization") {
-            let token = auth
-                .strip_prefix("Bearer ")
-                .or_else(|| auth.strip_prefix("bearer "))
-                .unwrap_or(auth.as_str());
-            if tokens.iter().any(|item| token == item.as_str()) {
-                return true;
-            }
-        }
-
-        false
+        let intent = Intent::new(user_id, self.appservice.client.clone());
+        self.intents.write().await.insert(user_id.to_string(), intent.clone());
+        intent
     }
 
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
@@ -199,22 +155,26 @@ impl FeishuBridge {
         let portal = self
             .get_or_create_portal_by_feishu_room(&message.room_id)
             .await?;
-        portal.handle_feishu_message(message)?;
+
+        let intent = self.get_or_create_intent(&portal.bridge_info.bridgebot).await;
+        intent.ensure_registered().await?;
+
+        let matrix_text = formatter::convert_feishu_content_to_matrix_html(&message.content);
+        intent.send_text(&portal.mxid, &matrix_text).await?;
+
         Ok(())
     }
 
     pub async fn handle_matrix_message(
         &self,
         room_id: &str,
-        event: serde_json::Value,
+        event: Value,
     ) -> anyhow::Result<()> {
         info!("Handling Matrix message in room {}", room_id);
 
         let message = self.matrix_event_to_bridge_message(room_id, event)?;
         let portal = self.get_or_create_portal_by_matrix_room(room_id).await?;
-        portal.handle_matrix_message(message.clone())?;
 
-        // If a Matrix room has not yet been mapped to a real Feishu room, we skip sending.
         if portal.feishu_room_id.starts_with("mx_") {
             warn!(
                 "Skipping Matrix->Feishu forward for room {} because no Feishu room mapping exists yet",
@@ -371,25 +331,125 @@ fn sanitize_identifier(input: &str) -> String {
     }
 }
 
-struct MatrixRequestHandler {
+struct BridgeHandler {
     bridge: FeishuBridge,
 }
 
 #[async_trait]
-impl Handler for MatrixRequestHandler {
-    async fn handle(
-        &self,
-        req: &mut Request,
-        _depot: &mut Depot,
-        res: &mut Response,
-        _ctrl: &mut FlowCtrl,
-    ) {
-        self.bridge.handle_matrix_request(req, res).await;
-    }
-}
+impl AppserviceHandler for BridgeHandler {
+    async fn on_transaction(&self, _txn_id: &str, body: &Value) -> anyhow::Result<()> {
+        let events = body
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
 
-#[handler]
-async fn bridge_health(res: &mut Response) {
-    res.status_code(StatusCode::OK);
-    res.render("OK");
+        for event in events {
+            let event_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+
+            if event_type != "m.room.message" {
+                continue;
+            }
+
+            let room_id = match event.get("room_id").and_then(Value::as_str) {
+                Some(room_id) => room_id.to_string(),
+                None => continue,
+            };
+
+            if let Err(err) = self.bridge.handle_matrix_message(&room_id, event).await {
+                error!("Failed to process Matrix event in {}: {}", room_id, err);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn query_user(&self, user_id: &str) -> anyhow::Result<Option<Value>> {
+        info!("Query user: {}", user_id);
+        
+        let localpart = user_id
+            .strip_prefix('@')
+            .and_then(|s| s.split(':').next())
+            .unwrap_or(user_id);
+
+        if localpart.starts_with(&self.bridge.config.bridge.username_template.replace("{{.}}", "")) {
+            return Ok(Some(json!({
+                "displayname": localpart,
+            })));
+        }
+
+        Ok(None)
+    }
+
+    async fn query_room_alias(&self, room_alias: &str) -> anyhow::Result<Option<Value>> {
+        info!("Query room alias: {}", room_alias);
+        
+        let localpart = room_alias
+            .strip_prefix('#')
+            .and_then(|s| s.split(':').next())
+            .unwrap_or(room_alias);
+
+        if localpart.starts_with("feishu_") {
+            return Ok(Some(json!({
+                "name": format!("Feishu {}", localpart),
+                "topic": "Bridged from Feishu",
+                "preset": "private_chat",
+                "visibility": "private",
+            })));
+        }
+
+        Ok(None)
+    }
+
+    async fn thirdparty_protocol(&self, _protocol: &str) -> anyhow::Result<Option<Value>> {
+        Ok(Some(json!({
+            "user_fields": ["id", "name"],
+            "location_fields": ["id", "name"],
+            "icon": "mxc://example.org/feishu",
+            "field_types": {
+                "id": {
+                    "regexp": ".*",
+                    "placeholder": "Feishu ID"
+                },
+                "name": {
+                    "regexp": ".*",
+                    "placeholder": "Display name"
+                }
+            },
+            "instances": [{
+                "network_id": "feishu",
+                "bot_user_id": format!("@{}:{}", self.bridge.config.appservice.bot.username, self.bridge.config.homeserver.domain),
+                "desc": "Feishu",
+                "icon": "mxc://example.org/feishu",
+                "fields": {}
+            }]
+        })))
+    }
+
+    async fn thirdparty_user_remote(
+        &self,
+        _protocol: &str,
+        _fields: &HashMap<String, String>,
+    ) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn thirdparty_user_matrix(&self, _user_id: &str) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn thirdparty_location_remote(
+        &self,
+        _protocol: &str,
+        _fields: &HashMap<String, String>,
+    ) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn thirdparty_location_matrix(&self, _alias: &str) -> anyhow::Result<Vec<Value>> {
+        Ok(Vec::new())
+    }
 }

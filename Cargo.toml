@@ -30,6 +30,7 @@ libsqlite3-sys = { version = "0.35.0", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 regex = { version = "1", default-features = false, features = ["std"] }
@@ -43,6 +44,7 @@ sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
 url = "2"
+matrix-bot-sdk = { path = "../matrix-bot-sdk" }
 
 [profile.release]
 lto = true
