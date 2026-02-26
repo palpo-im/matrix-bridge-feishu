@@ -1,9 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use diesel::connection::SimpleConnection;
 use diesel::pg::PgConnection;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sqlite::SqliteConnection;
-use std::path::{Path, PathBuf};
 use tracing::info;
 
 pub type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;

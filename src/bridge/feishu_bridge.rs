@@ -1,22 +1,24 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use matrix_bot_sdk::appservice::{Appservice, AppserviceHandler, Intent};
 use matrix_bot_sdk::client::{MatrixAuth, MatrixClient};
 use salvo::prelude::*;
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use url::Url;
 
+use super::message::{BridgeMessage, MessageType};
+use super::portal::BridgePortal;
+use super::puppet::BridgePuppet;
+use super::user::BridgeUser;
 use crate::config::Config;
 use crate::database::Database;
 use crate::feishu::FeishuService;
 use crate::formatter;
-
-use super::message::{BridgeMessage, MessageType};
-use super::{portal::BridgePortal, puppet::BridgePuppet, user::BridgeUser};
 
 #[derive(Clone)]
 pub struct FeishuBridge {
@@ -142,7 +144,10 @@ impl FeishuBridge {
         drop(intents);
 
         let intent = Intent::new(user_id, self.appservice.client.clone());
-        self.intents.write().await.insert(user_id.to_string(), intent.clone());
+        self.intents
+            .write()
+            .await
+            .insert(user_id.to_string(), intent.clone());
         intent
     }
 
@@ -156,7 +161,9 @@ impl FeishuBridge {
             .get_or_create_portal_by_feishu_room(&message.room_id)
             .await?;
 
-        let intent = self.get_or_create_intent(&portal.bridge_info.bridgebot).await;
+        let intent = self
+            .get_or_create_intent(&portal.bridge_info.bridgebot)
+            .await;
         intent.ensure_registered().await?;
 
         let matrix_text = formatter::convert_feishu_content_to_matrix_html(&message.content);
@@ -165,11 +172,7 @@ impl FeishuBridge {
         Ok(())
     }
 
-    pub async fn handle_matrix_message(
-        &self,
-        room_id: &str,
-        event: Value,
-    ) -> anyhow::Result<()> {
+    pub async fn handle_matrix_message(&self, room_id: &str, event: Value) -> anyhow::Result<()> {
         info!("Handling Matrix message in room {}", room_id);
 
         let message = self.matrix_event_to_bridge_message(room_id, event)?;
@@ -369,13 +372,20 @@ impl AppserviceHandler for BridgeHandler {
 
     async fn query_user(&self, user_id: &str) -> anyhow::Result<Option<Value>> {
         info!("Query user: {}", user_id);
-        
+
         let localpart = user_id
             .strip_prefix('@')
             .and_then(|s| s.split(':').next())
             .unwrap_or(user_id);
 
-        if localpart.starts_with(&self.bridge.config.bridge.username_template.replace("{{.}}", "")) {
+        if localpart.starts_with(
+            &self
+                .bridge
+                .config
+                .bridge
+                .username_template
+                .replace("{{.}}", ""),
+        ) {
             return Ok(Some(json!({
                 "displayname": localpart,
             })));
@@ -386,7 +396,7 @@ impl AppserviceHandler for BridgeHandler {
 
     async fn query_room_alias(&self, room_alias: &str) -> anyhow::Result<Option<Value>> {
         info!("Query room alias: {}", room_alias);
-        
+
         let localpart = room_alias
             .strip_prefix('#')
             .and_then(|s| s.split(':').next())

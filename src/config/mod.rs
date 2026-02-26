@@ -1,8 +1,7 @@
 mod bridge;
 
-pub use bridge::*;
-
 use anyhow::Result;
+pub use bridge::*;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]

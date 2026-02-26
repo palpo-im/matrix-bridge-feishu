@@ -1,14 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 use salvo::prelude::*;
-use serde_json::{json, Value};
-use std::sync::Arc;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use super::{FeishuClient, FeishuWebhookEvent};
-use crate::bridge::message::{BridgeMessage, MessageType};
 use crate::bridge::FeishuBridge;
+use crate::bridge::message::{BridgeMessage, MessageType};
 
 #[derive(Clone)]
 pub struct FeishuService {

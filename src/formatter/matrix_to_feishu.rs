@@ -1,6 +1,7 @@
+use serde_json::{Value, json};
+
 use crate::bridge::message::{BridgeMessage, MessageType};
 use crate::feishu::types::FeishuRichText;
-use serde_json::{json, Value};
 
 pub fn format_matrix_to_feishu(message: BridgeMessage) -> Result<String, anyhow::Error> {
     let content = match message.msg_type {

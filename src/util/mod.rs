@@ -1,5 +1,6 @@
-use regex::Regex;
 use std::collections::HashMap;
+
+use regex::Regex;
 
 pub struct UidGenerator {
     cache: HashMap<String, String>,

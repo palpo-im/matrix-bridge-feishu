@@ -1,8 +1,10 @@
-use clap::Parser;
-use matrix_appservice_feishu::{bridge::FeishuBridge, config::Config};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{error, info, Level};
+
+use clap::Parser;
+use matrix_appservice_feishu::bridge::FeishuBridge;
+use matrix_appservice_feishu::config::Config;
+use tracing::{Level, error, info};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
