@@ -99,10 +99,6 @@ impl FeishuService {
             String::from_utf8(body_bytes.to_vec()).context("webhook payload is not valid UTF-8")?;
 
         self.verify_request_signature(req, &body_str, res).await?;
-        if res.status_code == Some(StatusCode::UNAUTHORIZED) {
-            return Ok(());
-        }
-
         let mut payload: Value =
             serde_json::from_str(&body_str).context("failed to parse webhook payload as JSON")?;
 
@@ -138,11 +134,20 @@ impl FeishuService {
             return Ok(());
         }
 
+        if res.status_code == Some(StatusCode::UNAUTHORIZED) {
+            return Ok(());
+        }
+
         let event: FeishuWebhookEvent =
             serde_json::from_value(payload).context("failed to parse webhook event body")?;
         info!("Received Feishu event: {}", event.header.event_type);
 
-        if event.header.event_type != "message.receive_v1" {
+        let supported_event = matches!(
+            event.header.event_type.as_str(),
+            "im.message.receive_v1" | "message.receive_v1"
+        );
+
+        if !supported_event {
             debug!(
                 "Ignoring unsupported Feishu event type: {}",
                 event.header.event_type
@@ -166,9 +171,16 @@ impl FeishuService {
         body: &str,
         res: &mut Response,
     ) -> Result<()> {
-        if self.listen_secret.is_empty() {
+        let signature_key = {
+            let client = self.client.lock().await;
+            client
+                .callback_signature_key(&self.listen_secret)
+                .map(ToOwned::to_owned)
+        };
+
+        let Some(signature_key) = signature_key else {
             return Ok(());
-        }
+        };
 
         let timestamp = req.header::<String>("X-Lark-Request-Timestamp");
         let nonce = req.header::<String>("X-Lark-Request-Nonce");
@@ -186,13 +198,7 @@ impl FeishuService {
 
         let valid_signature = {
             let client = self.client.lock().await;
-            client.verify_webhook_signature(
-                &self.listen_secret,
-                &timestamp,
-                &nonce,
-                body,
-                &signature,
-            )?
+            client.verify_webhook_signature(&signature_key, &timestamp, &nonce, body, &signature)?
         };
 
         if !valid_signature {
@@ -209,11 +215,11 @@ impl FeishuService {
             .event
             .message
             .ok_or_else(|| anyhow::anyhow!("No message content in webhook event"))?;
+        let parsed_content = parse_feishu_message_content(&message.content);
 
         let (content, msg_type) = match message.msg_type.as_str() {
             "text" => (
-                message
-                    .content
+                parsed_content
                     .get("text")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
@@ -287,6 +293,16 @@ fn parse_event_timestamp(value: &str) -> chrono::DateTime<Utc> {
     Utc::now()
 }
 
+fn parse_feishu_message_content(raw_content: &Value) -> Value {
+    match raw_content {
+        Value::Object(_) => raw_content.clone(),
+        Value::String(content) => {
+            serde_json::from_str::<Value>(content).unwrap_or_else(|_| json!({ "text": content }))
+        }
+        _ => Value::Null,
+    }
+}
+
 struct FeishuWebhookHandler {
     service: FeishuService,
     bridge: FeishuBridge,
@@ -317,4 +333,29 @@ impl Handler for FeishuWebhookHandler {
 async fn feishu_health(res: &mut Response) {
     res.status_code(StatusCode::OK);
     res.render("OK");
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::parse_feishu_message_content;
+
+    #[test]
+    fn parse_feishu_message_content_accepts_json_string() {
+        let parsed = parse_feishu_message_content(&json!("{\"text\":\"hello\"}"));
+        assert_eq!(
+            parsed.get("text").and_then(|value| value.as_str()),
+            Some("hello")
+        );
+    }
+
+    #[test]
+    fn parse_feishu_message_content_falls_back_to_plain_text() {
+        let parsed = parse_feishu_message_content(&json!("hello"));
+        assert_eq!(
+            parsed.get("text").and_then(|value| value.as_str()),
+            Some("hello")
+        );
+    }
 }

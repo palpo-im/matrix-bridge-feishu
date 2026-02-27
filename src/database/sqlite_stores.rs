@@ -73,8 +73,12 @@ impl SqliteStores {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            room_cache: Arc::new(Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()))),
-            user_cache: Arc::new(Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(1000).unwrap()))),
+            room_cache: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(1000).unwrap(),
+            ))),
+            user_cache: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(1000).unwrap(),
+            ))),
         }
     }
 
@@ -97,7 +101,10 @@ impl SqliteStores {
 
 #[async_trait]
 impl RoomStore for SqliteStores {
-    async fn get_room_by_matrix_id(&self, matrix_room_id: &str) -> DatabaseResult<Option<RoomMapping>> {
+    async fn get_room_by_matrix_id(
+        &self,
+        matrix_room_id: &str,
+    ) -> DatabaseResult<Option<RoomMapping>> {
         let cache_key = format!("mx:{}", matrix_room_id);
         if let Some(cached) = self.room_cache.lock().get(&cache_key).cloned() {
             return Ok(Some(cached));
@@ -123,7 +130,10 @@ impl RoomStore for SqliteStores {
         result
     }
 
-    async fn get_room_by_feishu_id(&self, feishu_chat_id: &str) -> DatabaseResult<Option<RoomMapping>> {
+    async fn get_room_by_feishu_id(
+        &self,
+        feishu_chat_id: &str,
+    ) -> DatabaseResult<Option<RoomMapping>> {
         let cache_key = format!("fs:{}", feishu_chat_id);
         if let Some(cached) = self.room_cache.lock().get(&cache_key).cloned() {
             return Ok(Some(cached));
@@ -194,7 +204,11 @@ impl RoomStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
-    async fn list_room_mappings(&self, limit: Option<i64>, offset: Option<i64>) -> DatabaseResult<Vec<RoomMapping>> {
+    async fn list_room_mappings(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> DatabaseResult<Vec<RoomMapping>> {
         let pool = self.pool.clone();
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
@@ -229,7 +243,10 @@ impl RoomStore for SqliteStores {
 
 #[async_trait]
 impl UserStore for SqliteStores {
-    async fn get_user_by_matrix_id(&self, matrix_user_id: &str) -> DatabaseResult<Option<UserMapping>> {
+    async fn get_user_by_matrix_id(
+        &self,
+        matrix_user_id: &str,
+    ) -> DatabaseResult<Option<UserMapping>> {
         let cache_key = format!("mx:{}", matrix_user_id);
         if let Some(cached) = self.user_cache.lock().get(&cache_key).cloned() {
             return Ok(Some(cached));
@@ -255,7 +272,10 @@ impl UserStore for SqliteStores {
         result
     }
 
-    async fn get_user_by_feishu_id(&self, feishu_user_id: &str) -> DatabaseResult<Option<UserMapping>> {
+    async fn get_user_by_feishu_id(
+        &self,
+        feishu_user_id: &str,
+    ) -> DatabaseResult<Option<UserMapping>> {
         let cache_key = format!("fs:{}", feishu_user_id);
         if let Some(cached) = self.user_cache.lock().get(&cache_key).cloned() {
             return Ok(Some(cached));
@@ -326,7 +346,11 @@ impl UserStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
-    async fn list_user_mappings(&self, limit: Option<i64>, offset: Option<i64>) -> DatabaseResult<Vec<UserMapping>> {
+    async fn list_user_mappings(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> DatabaseResult<Vec<UserMapping>> {
         let pool = self.pool.clone();
         let limit = limit.unwrap_or(100);
         let offset = offset.unwrap_or(0);
@@ -347,7 +371,10 @@ impl UserStore for SqliteStores {
 
 #[async_trait]
 impl MessageStore for SqliteStores {
-    async fn get_message_by_matrix_id(&self, matrix_event_id: &str) -> DatabaseResult<Option<MessageMapping>> {
+    async fn get_message_by_matrix_id(
+        &self,
+        matrix_event_id: &str,
+    ) -> DatabaseResult<Option<MessageMapping>> {
         let pool = self.pool.clone();
         let event_id = matrix_event_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -363,7 +390,10 @@ impl MessageStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
-    async fn get_message_by_feishu_id(&self, feishu_message_id: &str) -> DatabaseResult<Option<MessageMapping>> {
+    async fn get_message_by_feishu_id(
+        &self,
+        feishu_message_id: &str,
+    ) -> DatabaseResult<Option<MessageMapping>> {
         let pool = self.pool.clone();
         let fs_msg_id = feishu_message_id.to_string();
         tokio::task::spawn_blocking(move || {
@@ -379,7 +409,10 @@ impl MessageStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
-    async fn create_message_mapping(&self, mapping: &MessageMapping) -> DatabaseResult<MessageMapping> {
+    async fn create_message_mapping(
+        &self,
+        mapping: &MessageMapping,
+    ) -> DatabaseResult<MessageMapping> {
         let pool = self.pool.clone();
         let mapping = mapping.clone();
         tokio::task::spawn_blocking(move || {
@@ -408,7 +441,11 @@ impl MessageStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
-    async fn get_messages_by_room(&self, room_id: &str, limit: Option<i64>) -> DatabaseResult<Vec<MessageMapping>> {
+    async fn get_messages_by_room(
+        &self,
+        room_id: &str,
+        limit: Option<i64>,
+    ) -> DatabaseResult<Vec<MessageMapping>> {
         let pool = self.pool.clone();
         let room = room_id.to_string();
         let limit = limit.unwrap_or(100);
@@ -466,9 +503,11 @@ impl EventStore for SqliteStores {
         let before_str = before.to_rfc3339();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
-            let count = diesel::delete(processed_events::table.filter(processed_events::processed_at.lt(&before_str)))
-                .execute(&mut conn)
-                .map_err(DatabaseError::from)?;
+            let count = diesel::delete(
+                processed_events::table.filter(processed_events::processed_at.lt(&before_str)),
+            )
+            .execute(&mut conn)
+            .map_err(DatabaseError::from)?;
             Ok::<_, DatabaseError>(count as u64)
         })
         .await

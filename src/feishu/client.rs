@@ -1,15 +1,18 @@
-use anyhow::Result;
+use aes::Aes256;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose;
-use hmac::{Hmac, Mac};
+use cbc::cipher::block_padding::Pkcs7;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit};
 use reqwest::Client;
 use serde_json::Value;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tracing::debug;
+use uuid::Uuid;
 
 use super::types::*;
 
-type HmacSha256 = Hmac<Sha256>;
+type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
 #[derive(Clone)]
 pub struct FeishuClient {
@@ -108,16 +111,14 @@ impl FeishuClient {
 
     pub async fn send_text_message(&mut self, chat_id: &str, content: &str) -> Result<String> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = "https://open.feishu.cn/open-apis/im/v1/messages";
+        let url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id";
 
-        let payload = serde_json::json!({
-            "receive_id_type": "chat_id",
-            "receive_id": chat_id,
-            "content_type": "text",
-            "content": serde_json::json!({
-                "text": content
-            })
-        });
+        let payload = Self::build_message_payload(
+            chat_id,
+            "text",
+            serde_json::json!({ "text": content }),
+            Some(Uuid::new_v4().to_string()),
+        )?;
 
         let response = self
             .client
@@ -149,14 +150,13 @@ impl FeishuClient {
         rich_text: &FeishuRichText,
     ) -> Result<String> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = "https://open.feishu.cn/open-apis/im/v1/messages";
-
-        let payload = serde_json::json!({
-            "receive_id_type": "chat_id",
-            "receive_id": chat_id,
-            "content_type": "post",
-            "content": rich_text
-        });
+        let url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id";
+        let payload = Self::build_message_payload(
+            chat_id,
+            "post",
+            serde_json::to_value(rich_text).context("failed to serialize rich text payload")?,
+            Some(Uuid::new_v4().to_string()),
+        )?;
 
         let response = self
             .client
@@ -229,20 +229,14 @@ impl FeishuClient {
             return Ok(true);
         }
 
-        let signature = provided_signature.trim().trim_start_matches("sha256=");
-
-        let payload_compact = format!("{}{}{}", timestamp, nonce, body);
-        let payload_lines = format!("{}\n{}\n{}", timestamp, nonce, body);
-
-        let compact_b64 = self.sign_hmac_base64(signing_secret, payload_compact.as_bytes())?;
-        let compact_hex = self.sign_hmac_hex(signing_secret, payload_compact.as_bytes())?;
-        let lines_b64 = self.sign_hmac_base64(signing_secret, payload_lines.as_bytes())?;
-        let lines_hex = self.sign_hmac_hex(signing_secret, payload_lines.as_bytes())?;
-
-        Ok(signature == compact_b64
-            || signature == compact_hex
-            || signature == lines_b64
-            || signature == lines_hex)
+        // Feishu signature uses SHA256(timestamp + nonce + encrypt_key + raw_body) in hex.
+        let signature = provided_signature
+            .trim()
+            .trim_start_matches("sha256=")
+            .to_ascii_lowercase();
+        let payload = format!("{}{}{}{}", timestamp, nonce, signing_secret, body);
+        let expected = hex::encode(Sha256::digest(payload.as_bytes()));
+        Ok(signature == expected)
     }
 
     pub fn verify_verification_token(&self, token: Option<&str>) -> bool {
@@ -253,31 +247,101 @@ impl FeishuClient {
         }
     }
 
-    fn sign_hmac_base64(&self, signing_secret: &str, payload: &[u8]) -> Result<String> {
-        let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())?;
-        mac.update(payload);
-        let sig = mac.finalize().into_bytes();
-        Ok(general_purpose::STANDARD.encode(sig))
-    }
-
-    fn sign_hmac_hex(&self, signing_secret: &str, payload: &[u8]) -> Result<String> {
-        let mut mac = HmacSha256::new_from_slice(signing_secret.as_bytes())?;
-        mac.update(payload);
-        let sig = mac.finalize().into_bytes();
-        Ok(hex::encode(sig))
-    }
-
     pub fn decrypt_webhook_content(&self, encrypt: &str) -> Result<String> {
-        if self.encrypt_key.is_none() {
+        let Some(encrypt_key) = self.encrypt_key.as_ref() else {
             return Ok(encrypt.to_string());
+        };
+
+        let decoded = general_purpose::STANDARD
+            .decode(encrypt)
+            .context("encrypted webhook payload is not valid base64")?;
+        if decoded.len() < 16 {
+            anyhow::bail!("encrypted webhook payload is too short");
         }
 
-        let decoded = general_purpose::STANDARD.decode(encrypt)?;
-        if let Ok(text) = String::from_utf8(decoded) {
-            debug!("Webhook payload parsed from base64 content");
-            return Ok(text);
+        let iv = &decoded[..16];
+        let mut encrypted = decoded[16..].to_vec();
+        let key = Sha256::digest(encrypt_key.as_bytes());
+
+        let decrypted = Aes256CbcDec::new_from_slices(key.as_slice(), iv)
+            .context("invalid encrypt key or IV for webhook decryption")?
+            .decrypt_padded_mut::<Pkcs7>(&mut encrypted)
+            .map_err(|_| anyhow::anyhow!("failed to decrypt webhook payload with AES-256-CBC"))?;
+
+        let text = String::from_utf8(decrypted.to_vec())
+            .context("decrypted webhook payload is not valid UTF-8")?;
+        debug!("Webhook payload decrypted successfully");
+        Ok(text)
+    }
+
+    pub fn callback_signature_key<'a>(&'a self, fallback_secret: &'a str) -> Option<&'a str> {
+        self.encrypt_key
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| (!fallback_secret.is_empty()).then_some(fallback_secret))
+    }
+
+    fn build_message_payload(
+        receive_id: &str,
+        msg_type: &str,
+        content: Value,
+        uuid: Option<String>,
+    ) -> Result<Value> {
+        let mut payload = serde_json::json!({
+            "receive_id": receive_id,
+            "msg_type": msg_type,
+            "content": serde_json::to_string(&content)
+                .context("failed to serialize Feishu message content")?,
+        });
+
+        if let Some(uuid) = uuid {
+            payload["uuid"] = Value::String(uuid);
         }
 
-        anyhow::bail!("encrypted webhook payload cannot be decrypted with current configuration")
+        Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FeishuClient;
+    use sha2::Digest;
+
+    #[test]
+    fn verify_webhook_signature_uses_official_sha256_formula() {
+        let client = FeishuClient::new(
+            "app".to_string(),
+            "secret".to_string(),
+            Some("encrypt_key".to_string()),
+            None,
+        );
+        let timestamp = "1700000000";
+        let nonce = "abc123";
+        let body = r#"{"encrypt":"xxx"}"#;
+        let expected = hex::encode(sha2::Sha256::digest(
+            format!("{}{}{}{}", timestamp, nonce, "encrypt_key", body).as_bytes(),
+        ));
+
+        let valid = client
+            .verify_webhook_signature("encrypt_key", timestamp, nonce, body, &expected)
+            .expect("signature validation should not fail");
+
+        assert!(valid);
+    }
+
+    #[test]
+    fn decrypt_webhook_content_uses_aes_256_cbc() {
+        let client = FeishuClient::new(
+            "app".to_string(),
+            "secret".to_string(),
+            Some("test key".to_string()),
+            None,
+        );
+
+        let decrypted = client
+            .decrypt_webhook_content("P37w+VZImNgPEO1RBhJ6RtKl7n6zymIbEG1pReEzghk=")
+            .expect("decryption should succeed");
+
+        assert_eq!(decrypted, "hello world");
     }
 }

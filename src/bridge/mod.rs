@@ -9,9 +9,20 @@ pub mod provisioning;
 pub mod puppet;
 pub mod user;
 
-pub use command_handler::{FeishuCommandHandler, FeishuCommandOutcome, MatrixCommandHandler, MatrixCommandOutcome};
+pub use command_handler::{
+    FeishuCommandHandler, FeishuCommandOutcome, MatrixCommandHandler, MatrixCommandOutcome,
+};
 pub use event_processor::{MatrixEvent, MatrixEventProcessor};
 pub use feishu_bridge::FeishuBridge;
-pub use message_flow::{FeishuInboundMessage, MatrixInboundMessage, MessageFlow, OutboundFeishuMessage, OutboundMatrixMessage};
-pub use presence_handler::{FeishuPresence, FeishuPresenceStatus, MatrixPresenceState, MatrixPresenceTarget, PresenceHandler};
-pub use provisioning::{ApprovalResponseStatus, BridgeRequestStatus, PendingBridgeRequest, ProvisioningCoordinator, ProvisioningError};
+pub use message_flow::{
+    FeishuInboundMessage, MatrixInboundMessage, MessageFlow, OutboundFeishuMessage,
+    OutboundMatrixMessage,
+};
+pub use presence_handler::{
+    FeishuPresence, FeishuPresenceStatus, MatrixPresenceState, MatrixPresenceTarget,
+    PresenceHandler,
+};
+pub use provisioning::{
+    ApprovalResponseStatus, BridgeRequestStatus, PendingBridgeRequest, ProvisioningCoordinator,
+    ProvisioningError,
+};

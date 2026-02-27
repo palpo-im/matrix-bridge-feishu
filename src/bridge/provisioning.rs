@@ -95,10 +95,7 @@ impl ProvisioningCoordinator {
         Ok(())
     }
 
-    pub async fn wait_for_approval(
-        &self,
-        feishu_chat_id: &str,
-    ) -> Result<(), ProvisioningError> {
+    pub async fn wait_for_approval(&self, feishu_chat_id: &str) -> Result<(), ProvisioningError> {
         let timeout = self.request_timeout;
         let start = std::time::Instant::now();
 
@@ -137,7 +134,11 @@ impl ProvisioningCoordinator {
         }
     }
 
-    pub async fn mark_approval(&self, feishu_chat_id: &str, approved: bool) -> ApprovalResponseStatus {
+    pub async fn mark_approval(
+        &self,
+        feishu_chat_id: &str,
+        approved: bool,
+    ) -> ApprovalResponseStatus {
         let mut requests = self.pending_requests.lock().await;
 
         if let Some(request) = requests.get_mut(feishu_chat_id) {

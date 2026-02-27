@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use salvo::affix_state;
 use salvo::oapi::extract::JsonBody;
 use salvo::prelude::*;
-use salvo::affix_state;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::{PendingBridgeRequest, ProvisioningCoordinator};
@@ -16,15 +16,23 @@ pub struct ProvisioningApi {
 
 impl ProvisioningApi {
     pub fn new(room_store: Arc<dyn RoomStore>, provisioning: Arc<ProvisioningCoordinator>) -> Self {
-        Self { room_store, provisioning }
+        Self {
+            room_store,
+            provisioning,
+        }
     }
 
     pub fn router(self) -> Router {
         Router::new()
-            .push(Router::with_path("/v1/bridge").post(create_bridge))
-            .push(Router::with_path("/v1/bridge/<room_id>").delete(delete_bridge))
-            .push(Router::with_path("/v1/bridges").get(list_bridges))
-            .push(Router::with_path("/v1/pending").get(list_pending))
+            .push(Router::with_path("bridge").post(create_bridge))
+            .push(Router::with_path("bridge/<room_id>").delete(delete_bridge))
+            .push(
+                Router::with_path("bridges")
+                    .get(list_bridges)
+                    .post(create_bridge),
+            )
+            .push(Router::with_path("bridges/<room_id>").delete(delete_bridge))
+            .push(Router::with_path("pending").get(list_pending))
             .hoop(affix_state::inject(self))
     }
 }
@@ -43,11 +51,7 @@ pub struct BridgeResponse {
 }
 
 #[handler]
-async fn create_bridge(
-    req: JsonBody<BridgeRequest>,
-    depot: &mut Depot,
-    res: &mut Response,
-) {
+async fn create_bridge(req: JsonBody<BridgeRequest>, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
 
     match api
@@ -73,11 +77,7 @@ async fn create_bridge(
 }
 
 #[handler]
-async fn delete_bridge(
-    req: &mut Request,
-    depot: &mut Depot,
-    res: &mut Response,
-) {
+async fn delete_bridge(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
     let room_id = req.param::<String>("room_id").unwrap_or_default();
 
@@ -171,7 +171,7 @@ async fn list_pending(depot: &mut Depot, res: &mut Response) {
         .into_iter()
         .map(|r| r.into())
         .collect();
-    
+
     let count = pending.len();
     res.render(Json(PendingResponse { pending, count }));
 }

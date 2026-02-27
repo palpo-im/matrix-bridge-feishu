@@ -36,7 +36,11 @@ pub trait MatrixPresenceTarget: Send + Sync {
         presence: MatrixPresenceState,
         status_message: &str,
     ) -> anyhow::Result<()>;
-    async fn ensure_user_registered(&self, feishu_user_id: &str, username: Option<&str>) -> anyhow::Result<()>;
+    async fn ensure_user_registered(
+        &self,
+        feishu_user_id: &str,
+        username: Option<&str>,
+    ) -> anyhow::Result<()>;
 }
 
 pub struct PresenceHandler {
@@ -63,7 +67,10 @@ impl PresenceHandler {
         });
     }
 
-    pub async fn process_next<T: MatrixPresenceTarget + ?Sized>(&self, target: &T) -> anyhow::Result<()> {
+    pub async fn process_next<T: MatrixPresenceTarget + ?Sized>(
+        &self,
+        target: &T,
+    ) -> anyhow::Result<()> {
         let batch: Vec<FeishuPresence> = {
             let mut q = self.queue.lock().await;
             let mut batch = Vec::with_capacity(self.batch_size);
@@ -81,12 +88,17 @@ impl PresenceHandler {
             let matrix_presence = match presence.status {
                 FeishuPresenceStatus::Online => MatrixPresenceState::Online,
                 FeishuPresenceStatus::Offline => MatrixPresenceState::Offline,
-                FeishuPresenceStatus::Busy | FeishuPresenceStatus::Away => MatrixPresenceState::Unavailable,
+                FeishuPresenceStatus::Busy | FeishuPresenceStatus::Away => {
+                    MatrixPresenceState::Unavailable
+                }
             };
 
             let status_msg = presence.status_message.unwrap_or_default();
 
-            if let Err(e) = target.set_presence(&presence.user_id, matrix_presence, &status_msg).await {
+            if let Err(e) = target
+                .set_presence(&presence.user_id, matrix_presence, &status_msg)
+                .await
+            {
                 tracing::warn!("Failed to set presence for {}: {}", presence.user_id, e);
             }
         }

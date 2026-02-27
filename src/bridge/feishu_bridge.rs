@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -7,23 +8,28 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sqlite::SqliteConnection;
 use matrix_bot_sdk::appservice::{Appservice, AppserviceHandler, Intent};
 use matrix_bot_sdk::client::{MatrixAuth, MatrixClient};
+use salvo::affix_state;
 use salvo::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use super::MatrixEvent;
 use super::message::{BridgeMessage, MessageType};
 use super::portal::BridgePortal;
 use super::puppet::BridgePuppet;
 use super::user::BridgeUser;
-use super::MatrixEvent;
-use crate::bridge::{MatrixCommandHandler, MatrixCommandOutcome, MatrixEventProcessor, MessageFlow, PresenceHandler, ProvisioningCoordinator};
+use crate::bridge::{
+    MatrixCommandHandler, MatrixCommandOutcome, MatrixEventProcessor, MessageFlow, PresenceHandler,
+    ProvisioningCoordinator,
+};
 use crate::config::Config;
-use crate::database::{Database, EventStore, RoomStore};
 use crate::database::sqlite_stores::SqliteStores;
+use crate::database::{Database, EventStore, MessageMapping, MessageStore, RoomStore};
 use crate::feishu::FeishuService;
 use crate::formatter;
+use crate::web::ProvisioningApi;
 
 type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -43,12 +49,13 @@ pub struct FeishuBridge {
     command_handler: Arc<MatrixCommandHandler>,
     provisioning: Arc<ProvisioningCoordinator>,
     presence_handler: Arc<PresenceHandler>,
+    started_at: Instant,
 }
 
 impl FeishuBridge {
     pub async fn new(config: Config) -> anyhow::Result<Self> {
         let config = Arc::new(config);
-        
+
         let db_type = &config.appservice.database.r#type;
         let db_uri = &config.appservice.database.uri;
         let max_open = config.appservice.database.max_open_conns;
@@ -109,6 +116,7 @@ impl FeishuBridge {
             command_handler,
             provisioning,
             presence_handler,
+            started_at: Instant::now(),
         })
     }
 
@@ -150,13 +158,18 @@ impl FeishuBridge {
         });
 
         let room_store = self.stores.room_store();
+        let message_store = self.stores.message_store();
         let event_store = self.stores.event_store();
-        let message_flow = Arc::new(MessageFlow::new(self.config.clone(), self.feishu_service.clone()));
-        
+        let message_flow = Arc::new(MessageFlow::new(
+            self.config.clone(),
+            self.feishu_service.clone(),
+        ));
+
         let event_processor = Arc::new(MatrixEventProcessor::new(
             self.config.clone(),
             self.feishu_service.clone(),
             room_store,
+            message_store,
             event_store,
             message_flow,
         ));
@@ -176,13 +189,28 @@ impl FeishuBridge {
         .with_handler(handler);
 
         let base_router = appservice_with_handler.router();
+        let provisioning_api = ProvisioningApi::new(self.room_store(), self.provisioning.clone());
+        let status_state = BridgeStatusState {
+            room_store: self.room_store(),
+            started_at: self.started_at,
+        };
 
         let health_router = Router::new()
             .push(Router::with_path("/health").get(health_handler))
-            .push(Router::with_path("/ready").get(ready_handler));
+            .push(Router::with_path("/ready").get(ready_handler))
+            .push(
+                Router::with_path("/status")
+                    .hoop(affix_state::inject(status_state))
+                    .get(status_handler),
+            );
+
+        let provisioning_router = Router::new()
+            .push(Router::with_path("/_matrix/app/v1").push(provisioning_api.clone().router()))
+            .push(Router::with_path("/admin").push(provisioning_api.router()));
 
         let router = Router::new()
             .push(base_router)
+            .push(provisioning_router)
             .push(health_router);
 
         let acceptor = TcpListener::new(format!(
@@ -228,11 +256,29 @@ impl FeishuBridge {
         self.stores.event_store()
     }
 
+    pub fn message_store(&self) -> Arc<dyn MessageStore> {
+        self.stores.message_store()
+    }
+
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
         info!(
             "Handling Feishu message {} in room {}",
             message.id, message.room_id
         );
+
+        if self
+            .stores
+            .message_store()
+            .get_message_by_feishu_id(&message.id)
+            .await?
+            .is_some()
+        {
+            debug!(
+                "Skipping already bridged Feishu message (duplicate or echo): {}",
+                message.id
+            );
+            return Ok(());
+        }
 
         let room_mapping = self
             .stores
@@ -244,14 +290,17 @@ impl FeishuBridge {
             BridgePortal::new(
                 message.room_id.clone(),
                 mapping.matrix_room_id.clone(),
-                mapping.feishu_chat_name.unwrap_or_else(|| message.room_id.clone()),
+                mapping
+                    .feishu_chat_name
+                    .unwrap_or_else(|| message.room_id.clone()),
                 format!(
                     "@{}:{}",
                     self.config.appservice.bot.username, self.config.homeserver.domain
                 ),
             )
         } else {
-            self.get_or_create_portal_by_feishu_room(&message.room_id).await?
+            self.get_or_create_portal_by_feishu_room(&message.room_id)
+                .await?
         };
 
         let intent = self
@@ -260,7 +309,23 @@ impl FeishuBridge {
         intent.ensure_registered().await?;
 
         let matrix_text = formatter::convert_feishu_content_to_matrix_html(&message.content);
-        intent.send_text(&portal.mxid, &matrix_text).await?;
+        let matrix_event_id = intent.send_text(&portal.mxid, &matrix_text).await?;
+
+        let link = MessageMapping::new(
+            matrix_event_id,
+            message.id,
+            portal.mxid.clone(),
+            portal.bridge_info.bridgebot.clone(),
+            message.sender,
+        );
+        if let Err(err) = self
+            .stores
+            .message_store()
+            .create_message_mapping(&link)
+            .await
+        {
+            warn!("Failed to persist Feishu->Matrix message mapping: {}", err);
+        }
 
         Ok(())
     }
@@ -281,9 +346,19 @@ impl FeishuBridge {
                 .room_store()
                 .get_room_by_matrix_id(room_id)
                 .await?;
-            
-            let outcome = self.command_handler.handle(body, room_mapping.is_some(), |_| true);
-            self.handle_command_outcome(outcome, room_id, event.get("sender").and_then(Value::as_str).unwrap_or("unknown")).await?;
+
+            let outcome = self
+                .command_handler
+                .handle(body, room_mapping.is_some(), |_| true);
+            self.handle_command_outcome(
+                outcome,
+                room_id,
+                event
+                    .get("sender")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown"),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -310,7 +385,7 @@ impl FeishuBridge {
         &self,
         outcome: MatrixCommandOutcome,
         room_id: &str,
-        sender: &str,
+        _sender: &str,
     ) -> anyhow::Result<()> {
         match outcome {
             MatrixCommandOutcome::Ignored => {}
@@ -323,15 +398,29 @@ impl FeishuBridge {
                     feishu_chat_id.clone(),
                     Some(format!("Feishu {}", feishu_chat_id)),
                 );
-                self.stores.room_store().create_room_mapping(&mapping).await?;
+                self.stores
+                    .room_store()
+                    .create_room_mapping(&mapping)
+                    .await?;
                 info!("Created bridge: {} <-> {}", room_id, feishu_chat_id);
                 self.bot_intent
-                    .send_text(room_id, &format!("Bridged to Feishu chat: {}", feishu_chat_id))
+                    .send_text(
+                        room_id,
+                        &format!("Bridged to Feishu chat: {}", feishu_chat_id),
+                    )
                     .await?;
             }
             MatrixCommandOutcome::UnbridgeRequested => {
-                if let Some(mapping) = self.stores.room_store().get_room_by_matrix_id(room_id).await? {
-                    self.stores.room_store().delete_room_mapping(mapping.id).await?;
+                if let Some(mapping) = self
+                    .stores
+                    .room_store()
+                    .get_room_by_matrix_id(room_id)
+                    .await?
+                {
+                    self.stores
+                        .room_store()
+                        .delete_room_mapping(mapping.id)
+                        .await?;
                     info!("Removed bridge for room {}", room_id);
                     self.bot_intent.send_text(room_id, "Bridge removed").await?;
                 }
@@ -495,6 +584,35 @@ async fn ready_handler(res: &mut Response) {
     res.render(Json(serde_json::json!({ "ready": true })));
 }
 
+#[derive(Clone)]
+struct BridgeStatusState {
+    room_store: Arc<dyn RoomStore>,
+    started_at: Instant,
+}
+
+#[handler]
+async fn status_handler(depot: &mut Depot, res: &mut Response) {
+    let state: &BridgeStatusState = depot.obtain().unwrap();
+    match state.room_store.count_rooms().await {
+        Ok(bridged_rooms) => {
+            res.status_code(StatusCode::OK);
+            res.render(Json(serde_json::json!({
+                "status": "running",
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_seconds": state.started_at.elapsed().as_secs(),
+                "bridged_rooms": bridged_rooms,
+            })));
+        }
+        Err(err) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "status": "degraded",
+                "error": err.to_string(),
+            })));
+        }
+    }
+}
+
 struct BridgeHandler {
     bridge: FeishuBridge,
     event_processor: Arc<MatrixEventProcessor>,
@@ -526,11 +644,17 @@ impl AppserviceHandler for BridgeHandler {
                 .unwrap_or_default();
 
             let matrix_event = MatrixEvent {
-                event_id: event.get("event_id").and_then(Value::as_str).map(ToOwned::to_owned),
+                event_id: event
+                    .get("event_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 event_type: event_type.to_string(),
                 room_id: room_id.to_string(),
                 sender: sender.to_string(),
-                state_key: event.get("state_key").and_then(Value::as_str).map(ToOwned::to_owned),
+                state_key: event
+                    .get("state_key")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 content: event.get("content").cloned(),
                 timestamp: event.get("origin_server_ts").map(|v| v.to_string()),
             };

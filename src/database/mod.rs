@@ -1,7 +1,7 @@
 pub mod error;
 pub mod models;
-pub mod stores;
 pub mod sqlite_stores;
+pub mod stores;
 
 pub use error::{DatabaseError, DatabaseResult};
 pub use models::{MessageMapping, ProcessedEvent, RoomMapping, UserMapping};

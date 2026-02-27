@@ -1794,14 +1794,15 @@ dependencies = [
 name = "matrix-bridge-feishu"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "anyhow",
  "async-trait",
  "base64",
+ "cbc",
  "chrono",
  "clap",
  "diesel",
  "hex",
- "hmac",
  "libsqlite3-sys",
  "lru",
  "matrix-bot-sdk",

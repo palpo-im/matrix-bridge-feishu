@@ -4,9 +4,11 @@ use serde_json::Value;
 use tracing::{debug, info, warn};
 
 use crate::bridge::command_handler::{MatrixCommandHandler, MatrixCommandOutcome};
-use crate::bridge::message_flow::{MessageFlow, MatrixInboundMessage};
+use crate::bridge::message_flow::{MatrixInboundMessage, MessageFlow};
 use crate::config::Config;
-use crate::database::{EventStore, ProcessedEvent, RoomMapping, RoomStore};
+use crate::database::{
+    EventStore, MessageMapping, MessageStore, ProcessedEvent, RoomMapping, RoomStore,
+};
 use crate::feishu::FeishuService;
 
 #[derive(Debug, Clone)]
@@ -24,6 +26,7 @@ pub struct MatrixEventProcessor {
     config: Arc<Config>,
     feishu_service: Arc<FeishuService>,
     room_store: Arc<dyn RoomStore>,
+    message_store: Arc<dyn MessageStore>,
     event_store: Arc<dyn EventStore>,
     message_flow: Arc<MessageFlow>,
     command_handler: MatrixCommandHandler,
@@ -34,6 +37,7 @@ impl MatrixEventProcessor {
         config: Arc<Config>,
         feishu_service: Arc<FeishuService>,
         room_store: Arc<dyn RoomStore>,
+        message_store: Arc<dyn MessageStore>,
         event_store: Arc<dyn EventStore>,
         message_flow: Arc<MessageFlow>,
     ) -> Self {
@@ -42,6 +46,7 @@ impl MatrixEventProcessor {
             config,
             feishu_service,
             room_store,
+            message_store,
             event_store,
             message_flow,
             command_handler: MatrixCommandHandler::new(self_service),
@@ -137,9 +142,26 @@ impl MatrixEventProcessor {
             preview_text(&content, 100)
         );
 
-        self.feishu_service
+        let feishu_message_id = self
+            .feishu_service
             .send_text_message(&mapping.feishu_chat_id, &content)
             .await?;
+
+        if let Some(event_id) = &event.event_id {
+            let link = MessageMapping::new(
+                event_id.clone(),
+                feishu_message_id,
+                event.room_id.clone(),
+                event.sender.clone(),
+                "matrix".to_string(),
+            );
+            if let Err(err) = self.message_store.create_message_mapping(&link).await {
+                warn!(
+                    "Failed to persist Matrix->Feishu message mapping for event {}: {}",
+                    event_id, err
+                );
+            }
+        }
 
         info!(
             "Bridged Matrix message to Feishu: room={} chat={}",
