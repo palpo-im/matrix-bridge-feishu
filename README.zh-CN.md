@@ -32,6 +32,7 @@ cargo run -- -c config.yaml
 
 ```bash
 export CONFIG_PATH="/etc/matrix-bridge-feishu/config.yaml"
+export MATRIX_BRIDGE_FEISHU_DB_TYPE="sqlite"
 export MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET="real-secret"
 export MATRIX_BRIDGE_FEISHU_DB_URI="sqlite:matrix-feishu.db"
 export MATRIX_BRIDGE_FEISHU_AS_TOKEN="real_as_token"
@@ -72,7 +73,7 @@ Provisioning 接口默认启用 Bearer 鉴权：
 | Thread/topic 映射 | 已支持 | 维护 `thread_id/root_id/parent_id` |
 | dead-letter + 回放 | 已支持 | 失败 webhook 任务可查询并手工回放 |
 | 媒体去重缓存 | 已支持 | 基于内容哈希复用飞书资源 key |
-| PostgreSQL stores | 未支持 | 当前桥接存储仅支持 SQLite |
+| PostgreSQL/MySQL stores | 未支持 | 当前版本有意收敛为 SQLite-only |
 
 ## 排障要点
 

@@ -23,7 +23,6 @@ serde_json = "1"
 serde_yaml = "0.9"
 diesel = { version = "2.3.6", default-features = false, features = [
     "sqlite",
-    "postgres",
     "r2d2",
     "chrono",
     "uuid",

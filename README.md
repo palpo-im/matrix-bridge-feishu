@@ -94,6 +94,7 @@ The bridge is built with a modular architecture:
 You can override configuration with environment variables:
 ```bash
 export CONFIG_PATH="/etc/matrix-bridge-feishu/config.yaml"
+export MATRIX_BRIDGE_FEISHU_DB_TYPE="sqlite"
 export MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET="real-secret"
 export MATRIX_BRIDGE_FEISHU_DB_URI="sqlite:matrix-feishu.db"
 export MATRIX_BRIDGE_FEISHU_AS_TOKEN="real_as_token"
@@ -363,7 +364,7 @@ Feishu card messages are converted to Matrix messages:
 | Thread/topic mapping | Supported | Stores and bridges `thread_id/root_id/parent_id` |
 | Dead-letter + replay | Supported | Failed webhook tasks can be listed/replayed via provisioning API |
 | Media dedupe cache | Supported | Reused Feishu uploaded key by content hash |
-| Postgres stores | Not supported | Bridge stores are SQLite-only in current build |
+| PostgreSQL/MySQL stores | Not supported | Bridge stores are intentionally SQLite-only in current build |
 
 ## Required Feishu Setup
 
