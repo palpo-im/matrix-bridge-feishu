@@ -17,8 +17,9 @@ pub struct ProvisioningApi {
     dead_letter_store: Arc<dyn DeadLetterStore>,
     bridge: FeishuBridge,
     provisioning: Arc<ProvisioningCoordinator>,
-    token: String,
-    admin_token: String,
+    read_token: String,
+    write_token: String,
+    delete_token: String,
     started_at: Instant,
 }
 
@@ -28,8 +29,9 @@ impl ProvisioningApi {
         dead_letter_store: Arc<dyn DeadLetterStore>,
         bridge: FeishuBridge,
         provisioning: Arc<ProvisioningCoordinator>,
-        token: String,
-        admin_token: String,
+        read_token: String,
+        write_token: String,
+        delete_token: String,
         started_at: Instant,
     ) -> Self {
         Self {
@@ -37,8 +39,9 @@ impl ProvisioningApi {
             dead_letter_store,
             bridge,
             provisioning,
-            token,
-            admin_token,
+            read_token,
+            write_token,
+            delete_token,
             started_at,
         }
     }
@@ -95,14 +98,46 @@ struct DeadLetterStatusSummary {
     total: i64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AuthScope {
+    Read,
+    Write,
+    Delete,
+}
+
+impl AuthScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            AuthScope::Read => "read",
+            AuthScope::Write => "write",
+            AuthScope::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AuthContext {
+    actor: String,
+    actor_source: String,
+    request_id: String,
+    scope: AuthScope,
+}
+
 #[handler]
 async fn provisioning_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, false, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Read, res) else {
         return;
     };
 
-    info!(action = "status", actor = %actor, "Provisioning status requested");
+    info!(
+        action = "status",
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
+        "Provisioning status requested"
+    );
 
     let bridged_rooms = match api.room_store.count_rooms().await {
         Ok(value) => value,
@@ -171,12 +206,15 @@ async fn create_bridge(
     res: &mut Response,
 ) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(raw_req, api, false, res) else {
+    let Some(auth) = require_auth(raw_req, api, AuthScope::Write, res) else {
         return;
     };
     info!(
         action = "create_bridge",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         chat_id = %req.feishu_chat_id,
         matrix_room_id = %req.matrix_room_id,
         "Provisioning request received"
@@ -184,7 +222,13 @@ async fn create_bridge(
 
     match api
         .provisioning
-        .request_bridge(&req.feishu_chat_id, &req.matrix_room_id, &req.requestor)
+        .request_bridge_with_audit(
+            &req.feishu_chat_id,
+            &req.matrix_room_id,
+            &req.requestor,
+            Some(&auth.request_id),
+            Some(&auth.actor_source),
+        )
         .await
     {
         Ok(()) => {
@@ -198,7 +242,9 @@ async fn create_bridge(
             res.status_code(StatusCode::BAD_REQUEST);
             warn!(
                 action = "create_bridge",
-                actor = %actor,
+                actor = %auth.actor,
+                actor_source = %auth.actor_source,
+                request_id = %auth.request_id,
                 chat_id = %req.feishu_chat_id,
                 matrix_room_id = %req.matrix_room_id,
                 error = %e,
@@ -215,13 +261,16 @@ async fn create_bridge(
 #[handler]
 async fn delete_bridge(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, true, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Delete, res) else {
         return;
     };
     let room_id = req.param::<String>("room_id").unwrap_or_default();
     info!(
         action = "delete_bridge",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         matrix_room_id = %room_id,
         "Provisioning delete requested"
     );
@@ -232,7 +281,9 @@ async fn delete_bridge(req: &mut Request, depot: &mut Depot, res: &mut Response)
                 res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
                 warn!(
                     action = "delete_bridge",
-                    actor = %actor,
+                    actor = %auth.actor,
+                    actor_source = %auth.actor_source,
+                    request_id = %auth.request_id,
                     matrix_room_id = %room_id,
                     chat_id = %mapping.feishu_chat_id,
                     error = %e,
@@ -246,7 +297,9 @@ async fn delete_bridge(req: &mut Request, depot: &mut Depot, res: &mut Response)
             }
             info!(
                 action = "delete_bridge",
-                actor = %actor,
+                actor = %auth.actor,
+                actor_source = %auth.actor_source,
+                request_id = %auth.request_id,
                 matrix_room_id = %room_id,
                 chat_id = %mapping.feishu_chat_id,
                 "Provisioning delete applied"
@@ -276,13 +329,16 @@ async fn delete_bridge(req: &mut Request, depot: &mut Depot, res: &mut Response)
 #[handler]
 async fn list_bridges(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, false, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Read, res) else {
         return;
     };
     let (limit, offset) = normalized_pagination(req, 100);
     info!(
         action = "list_bridges",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         limit = ?limit,
         offset = ?offset,
         "Provisioning list bridges"
@@ -307,13 +363,16 @@ async fn list_bridges(req: &mut Request, depot: &mut Depot, res: &mut Response) 
 #[handler]
 async fn list_mappings(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, false, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Read, res) else {
         return;
     };
     let (limit, offset) = normalized_pagination(req, 100);
     info!(
         action = "list_mappings",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         limit = ?limit,
         offset = ?offset,
         "Provisioning list mappings"
@@ -346,6 +405,8 @@ struct PendingBridgeRequestJson {
     pub feishu_chat_id: String,
     pub matrix_room_id: String,
     pub matrix_requestor: String,
+    pub request_id: Option<String>,
+    pub actor_source: Option<String>,
     pub created_at: String,
     pub status: String,
 }
@@ -356,6 +417,8 @@ impl From<PendingBridgeRequest> for PendingBridgeRequestJson {
             feishu_chat_id: req.feishu_chat_id,
             matrix_room_id: req.matrix_room_id,
             matrix_requestor: req.matrix_requestor,
+            request_id: req.request_id,
+            actor_source: req.actor_source,
             created_at: req.created_at.to_rfc3339(),
             status: format!("{:?}", req.status),
         }
@@ -365,10 +428,17 @@ impl From<PendingBridgeRequest> for PendingBridgeRequestJson {
 #[handler]
 async fn list_pending(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, false, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Read, res) else {
         return;
     };
-    info!(action = "list_pending", actor = %actor, "Provisioning list pending");
+    info!(
+        action = "list_pending",
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
+        "Provisioning list pending"
+    );
 
     let pending: Vec<PendingBridgeRequestJson> = api
         .provisioning
@@ -391,7 +461,7 @@ struct DeadLetterListResponse {
 #[handler]
 async fn list_dead_letters(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, false, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Read, res) else {
         return;
     };
 
@@ -400,7 +470,10 @@ async fn list_dead_letters(req: &mut Request, depot: &mut Depot, res: &mut Respo
     let offset = req.query::<i64>("offset");
     info!(
         action = "list_dead_letters",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         status = ?status,
         limit = ?limit,
         offset = ?offset,
@@ -432,14 +505,17 @@ async fn list_dead_letters(req: &mut Request, depot: &mut Depot, res: &mut Respo
 #[handler]
 async fn replay_dead_letter(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, true, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Write, res) else {
         return;
     };
 
     let id = req.param::<i64>("id").unwrap_or_default();
     info!(
         action = "replay_dead_letter",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         dead_letter_id = id,
         "Provisioning replay dead letter requested"
     );
@@ -493,7 +569,7 @@ async fn replay_dead_letters(
     res: &mut Response,
 ) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, true, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Write, res) else {
         return;
     };
 
@@ -520,7 +596,10 @@ async fn replay_dead_letters(
     };
     info!(
         action = "replay_dead_letters",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         requested = ids.len(),
         "Provisioning replay dead letters batch requested"
     );
@@ -578,7 +657,7 @@ async fn cleanup_dead_letters(
     res: &mut Response,
 ) {
     let api: &ProvisioningApi = depot.obtain().unwrap();
-    let Some(actor) = require_auth(req, api, true, res) else {
+    let Some(auth) = require_auth(req, api, AuthScope::Delete, res) else {
         return;
     };
 
@@ -590,7 +669,10 @@ async fn cleanup_dead_letters(
 
     info!(
         action = "cleanup_dead_letters",
-        actor = %actor,
+        actor = %auth.actor,
+        actor_source = %auth.actor_source,
+        request_id = %auth.request_id,
+        auth_scope = auth.scope.as_str(),
         status = ?status,
         older_than_hours = ?older_than_hours,
         limit = limit,
@@ -664,13 +746,16 @@ async fn cleanup_dead_letters(
 fn require_auth(
     req: &Request,
     api: &ProvisioningApi,
-    admin_required: bool,
+    required_scope: AuthScope,
     res: &mut Response,
-) -> Option<String> {
+) -> Option<AuthContext> {
+    let request_id = resolve_request_id(req);
     let provided = extract_access_token(req);
     let Some(token) = provided else {
         warn!(
-            action = if admin_required { "admin_auth" } else { "auth" },
+            action = "auth",
+            required_scope = required_scope.as_str(),
+            request_id = %request_id,
             "Provisioning request missing auth token"
         );
         res.status_code(StatusCode::UNAUTHORIZED);
@@ -681,14 +766,17 @@ fn require_auth(
         return None;
     };
 
-    let is_authorized = if admin_required {
-        token == api.admin_token
+    let granted_scope = resolve_scope_for_token(api, &token);
+    let is_authorized = if let Some(granted_scope) = granted_scope {
+        scope_satisfies(granted_scope, required_scope)
     } else {
-        token == api.token || token == api.admin_token
+        false
     };
     if !is_authorized {
         warn!(
-            action = if admin_required { "admin_auth" } else { "auth" },
+            action = "auth",
+            required_scope = required_scope.as_str(),
+            request_id = %request_id,
             "Provisioning request token mismatch"
         );
         res.status_code(StatusCode::UNAUTHORIZED);
@@ -699,7 +787,13 @@ fn require_auth(
         return None;
     }
 
-    Some(resolve_actor(req, &token))
+    let granted_scope = granted_scope.unwrap_or(AuthScope::Read);
+    Some(AuthContext {
+        actor: resolve_actor(req, &token),
+        actor_source: resolve_actor_source(req, granted_scope),
+        request_id,
+        scope: granted_scope,
+    })
 }
 
 fn normalized_pagination(req: &Request, default_limit: i64) -> (Option<i64>, Option<i64>) {
@@ -737,4 +831,63 @@ fn resolve_actor(req: &Request, token: &str) -> String {
         .rev()
         .collect();
     format!("token:{}", suffix)
+}
+
+fn resolve_scope_for_token(api: &ProvisioningApi, token: &str) -> Option<AuthScope> {
+    if token == api.delete_token {
+        return Some(AuthScope::Delete);
+    }
+    if token == api.write_token {
+        return Some(AuthScope::Write);
+    }
+    if token == api.read_token {
+        return Some(AuthScope::Read);
+    }
+    None
+}
+
+fn scope_satisfies(granted: AuthScope, required: AuthScope) -> bool {
+    auth_scope_rank(granted) >= auth_scope_rank(required)
+}
+
+fn auth_scope_rank(scope: AuthScope) -> u8 {
+    match scope {
+        AuthScope::Read => 1,
+        AuthScope::Write => 2,
+        AuthScope::Delete => 3,
+    }
+}
+
+fn resolve_request_id(req: &Request) -> String {
+    if let Some(request_id) = req.header::<String>("X-Request-Id") {
+        let request_id = request_id.trim();
+        if !request_id.is_empty() {
+            return request_id.to_string();
+        }
+    }
+    uuid::Uuid::new_v4().to_string()
+}
+
+fn resolve_actor_source(req: &Request, scope: AuthScope) -> String {
+    if let Some(actor_source) = req.header::<String>("X-Actor-Source") {
+        let actor_source = actor_source.trim();
+        if !actor_source.is_empty() {
+            return actor_source.to_string();
+        }
+    }
+
+    if let Some(forwarded_for) = req.header::<String>("X-Forwarded-For") {
+        let forwarded_for = forwarded_for.trim();
+        if !forwarded_for.is_empty() {
+            return format!("ip:{}", forwarded_for);
+        }
+    }
+    if let Some(real_ip) = req.header::<String>("X-Real-Ip") {
+        let real_ip = real_ip.trim();
+        if !real_ip.is_empty() {
+            return format!("ip:{}", real_ip);
+        }
+    }
+
+    format!("token_scope:{}", scope.as_str())
 }

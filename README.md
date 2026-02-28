@@ -139,8 +139,10 @@ Provisioning endpoints require bearer token authentication:
 Authorization: Bearer <token>
 ```
 
-- Read/Create endpoints use `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN` (defaults to `appservice.as_token`).
-- Delete endpoints require `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN` (defaults to provisioning token).
+- Read endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN`.
+- Write endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN`.
+- Delete/high-risk endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN`.
+- Backward compatibility: `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN` and `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN` still work as fallbacks.
 
 ### Provisioning/Ops Endpoints
 

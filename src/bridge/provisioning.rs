@@ -17,6 +17,8 @@ pub struct PendingBridgeRequest {
     pub feishu_chat_id: String,
     pub matrix_room_id: String,
     pub matrix_requestor: String,
+    pub request_id: Option<String>,
+    pub actor_source: Option<String>,
     pub created_at: DateTime<Utc>,
     pub status: BridgeRequestStatus,
 }
@@ -72,6 +74,18 @@ impl ProvisioningCoordinator {
         matrix_room_id: &str,
         matrix_requestor: &str,
     ) -> Result<(), ProvisioningError> {
+        self.request_bridge_with_audit(feishu_chat_id, matrix_room_id, matrix_requestor, None, None)
+            .await
+    }
+
+    pub async fn request_bridge_with_audit(
+        &self,
+        feishu_chat_id: &str,
+        matrix_room_id: &str,
+        matrix_requestor: &str,
+        request_id: Option<&str>,
+        actor_source: Option<&str>,
+    ) -> Result<(), ProvisioningError> {
         let mut requests = self.pending_requests.lock().await;
 
         if requests.contains_key(feishu_chat_id) {
@@ -82,13 +96,19 @@ impl ProvisioningCoordinator {
             feishu_chat_id: feishu_chat_id.to_string(),
             matrix_room_id: matrix_room_id.to_string(),
             matrix_requestor: matrix_requestor.to_string(),
+            request_id: request_id.map(ToOwned::to_owned),
+            actor_source: actor_source.map(ToOwned::to_owned),
             created_at: Utc::now(),
             status: BridgeRequestStatus::Pending,
         };
 
         info!(
-            "Created bridge request: chat={} room={} requestor={}",
-            feishu_chat_id, matrix_room_id, matrix_requestor
+            "Created bridge request: chat={} room={} requestor={} request_id={} actor_source={}",
+            feishu_chat_id,
+            matrix_room_id,
+            matrix_requestor,
+            request_id.unwrap_or("n/a"),
+            actor_source.unwrap_or("n/a")
         );
 
         requests.insert(feishu_chat_id.to_string(), request);

@@ -44,7 +44,7 @@ struct AdminApiTarget {
     /// Admin API base URL, default: http://<hostname>:<port>/admin from config
     #[arg(long)]
     admin_api: Option<String>,
-    /// Bearer token, default: MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN or appservice.as_token
+    /// Bearer token, defaults to scope-specific provisioning token env vars
     #[arg(long)]
     token: Option<String>,
 }
@@ -92,6 +92,13 @@ struct DeadLetterCleanupCommand {
     dry_run: bool,
     #[command(flatten)]
     target: AdminApiTarget,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TokenScope {
+    Read,
+    Write,
+    Delete,
 }
 
 const EXAMPLE_CONFIG: &str = include_str!("../example-config.yaml");
@@ -154,12 +161,12 @@ async fn run_management_command(command: Command, config: &Config) -> anyhow::Re
 
     match command {
         Command::Status(cmd) => {
-            let (base, token) = resolve_admin_access(config, &cmd.target);
+            let (base, token) = resolve_admin_access(config, &cmd.target, TokenScope::Read);
             let response = api_get(&client, &format!("{base}/status"), &token).await?;
             print_json(&response)?;
         }
         Command::Mappings(cmd) => {
-            let (base, token) = resolve_admin_access(config, &cmd.target);
+            let (base, token) = resolve_admin_access(config, &cmd.target, TokenScope::Read);
             let url = format!(
                 "{base}/mappings?limit={}&offset={}",
                 cmd.limit.max(1),
@@ -169,7 +176,7 @@ async fn run_management_command(command: Command, config: &Config) -> anyhow::Re
             print_json(&response)?;
         }
         Command::Replay(cmd) => {
-            let (base, token) = resolve_admin_access(config, &cmd.target);
+            let (base, token) = resolve_admin_access(config, &cmd.target, TokenScope::Write);
             let response = if let Some(id) = cmd.id {
                 api_post_json(
                     &client,
@@ -193,7 +200,7 @@ async fn run_management_command(command: Command, config: &Config) -> anyhow::Re
             print_json(&response)?;
         }
         Command::DeadLetterCleanup(cmd) => {
-            let (base, token) = resolve_admin_access(config, &cmd.target);
+            let (base, token) = resolve_admin_access(config, &cmd.target, TokenScope::Delete);
             let response = api_post_json(
                 &client,
                 &format!("{base}/dead-letters/cleanup"),
@@ -213,7 +220,11 @@ async fn run_management_command(command: Command, config: &Config) -> anyhow::Re
     Ok(())
 }
 
-fn resolve_admin_access(config: &Config, target: &AdminApiTarget) -> (String, String) {
+fn resolve_admin_access(
+    config: &Config,
+    target: &AdminApiTarget,
+    required_scope: TokenScope,
+) -> (String, String) {
     let base = target.admin_api.clone().unwrap_or_else(|| {
         format!(
             "http://{}:{}/admin",
@@ -221,13 +232,34 @@ fn resolve_admin_access(config: &Config, target: &AdminApiTarget) -> (String, St
         )
     });
 
-    let token = target.token.clone().unwrap_or_else(|| {
-        std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN")
-            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN"))
-            .unwrap_or_else(|_| config.appservice.as_token.clone())
-    });
+    let token = target
+        .token
+        .clone()
+        .or_else(|| env_token_for_scope(required_scope))
+        .unwrap_or_else(|| config.appservice.as_token.clone());
 
     (base.trim_end_matches('/').to_string(), token)
+}
+
+fn env_token_for_scope(scope: TokenScope) -> Option<String> {
+    match scope {
+        TokenScope::Read => std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN")
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN"))
+            .ok(),
+        TokenScope::Write => std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN")
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN"))
+            .ok(),
+        TokenScope::Delete => std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN")
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN"))
+            .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN"))
+            .ok(),
+    }
 }
 
 async fn api_get(client: &Client, url: &str, token: &str) -> anyhow::Result<Value> {

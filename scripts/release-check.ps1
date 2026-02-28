@@ -97,7 +97,10 @@ if ($dbUri.StartsWith("sqlite:")) {
 if (-not $SkipHttpChecks) {
     $appBase = "http://$($cfg.appservice.hostname):$($cfg.appservice.port)"
     $feishuListen = [string]$cfg.bridge.listen_address
-    $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN
+    $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN
+    if ([string]::IsNullOrWhiteSpace($provisionToken)) {
+        $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN
+    }
     if ([string]::IsNullOrWhiteSpace($provisionToken)) {
         $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN
     }

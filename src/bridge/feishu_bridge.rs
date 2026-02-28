@@ -201,18 +201,25 @@ impl FeishuBridge {
         .with_handler(handler);
 
         let base_router = appservice_with_handler.router();
-        let provisioning_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN")
+        let default_provisioning_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN")
             .unwrap_or_else(|_| self.config.appservice.as_token.clone());
-        let provisioning_admin_token =
-            std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN")
-                .unwrap_or_else(|_| provisioning_token.clone());
+        let provisioning_read_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN")
+            .unwrap_or_else(|_| default_provisioning_token.clone());
+        let provisioning_write_token =
+            std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN")
+                .unwrap_or_else(|_| default_provisioning_token.clone());
+        let provisioning_delete_token =
+            std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN")
+                .or_else(|_| std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN"))
+                .unwrap_or_else(|_| provisioning_write_token.clone());
         let provisioning_api = ProvisioningApi::new(
             self.room_store(),
             self.dead_letter_store(),
             self.clone(),
             self.provisioning.clone(),
-            provisioning_token,
-            provisioning_admin_token,
+            provisioning_read_token,
+            provisioning_write_token,
+            provisioning_delete_token,
             self.started_at,
         );
         let status_state = BridgeStatusState {
