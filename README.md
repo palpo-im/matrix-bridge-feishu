@@ -13,7 +13,7 @@ A Matrix bridge for Feishu (飞书), built with Rust and the Salvo web framework
 - **User and room synchronization** with proper mapping
 - **Webhook-based integration** with Feishu APIs
 - **High performance** built with Rust
-- **Flexible database** support (SQLite/PostgreSQL)
+- **SQLite-backed persistence** for bridge mappings and event state
 - **Comprehensive logging** and error handling
 - **Encrypted message** support with Feishu
 
@@ -32,7 +32,7 @@ The bridge is built with a modular architecture:
 ### Prerequisites
 
 - Rust 1.75+
-- SQLite or PostgreSQL
+- SQLite
 - Matrix homeserver (Synapse, Dendrite, etc.)
 - Feishu app credentials
 
@@ -94,7 +94,7 @@ The bridge is built with a modular architecture:
 You can override configuration with environment variables:
 ```bash
 export APPSERVICE_FEISHU_BRIDGE_APP_SECRET="your-secret"
-export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="postgresql://..."
+export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="sqlite:matrix-feishu.db"
 ```
 
 ## Feishu Setup
@@ -129,10 +129,7 @@ export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="postgresql://..."
 
 ## Database
 
-The bridge uses Diesel for database operations with support for:
-
-- **SQLite**: For small deployments
-- **PostgreSQL**: For production use
+The bridge currently uses SQLite for bridge store persistence.
 
 ### Migrations
 

@@ -28,6 +28,9 @@ pub struct MessageMapping {
     pub id: i64,
     pub matrix_event_id: String,
     pub feishu_message_id: String,
+    pub thread_id: Option<String>,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
     pub room_id: String,
     pub sender_mxid: String,
     pub sender_feishu_id: String,
@@ -94,11 +97,26 @@ impl MessageMapping {
             id: 0,
             matrix_event_id,
             feishu_message_id,
+            thread_id: None,
+            root_id: None,
+            parent_id: None,
             room_id,
             sender_mxid,
             sender_feishu_id,
             content_hash: None,
             created_at: Utc::now(),
         }
+    }
+
+    pub fn with_threading(
+        mut self,
+        thread_id: Option<String>,
+        root_id: Option<String>,
+        parent_id: Option<String>,
+    ) -> Self {
+        self.thread_id = thread_id;
+        self.root_id = root_id;
+        self.parent_id = parent_id;
+        self
     }
 }

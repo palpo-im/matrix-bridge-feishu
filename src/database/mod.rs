@@ -238,6 +238,9 @@ CREATE TABLE IF NOT EXISTS message_mappings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     matrix_event_id TEXT NOT NULL UNIQUE,
     feishu_message_id TEXT NOT NULL UNIQUE,
+    thread_id TEXT,
+    root_id TEXT,
+    parent_id TEXT,
     room_id TEXT NOT NULL,
     sender_mxid TEXT NOT NULL,
     sender_feishu_id TEXT NOT NULL,
@@ -261,6 +264,9 @@ CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(ma
 CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
 CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS thread_id TEXT;
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS root_id TEXT;
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS parent_id TEXT;
 "#;
 
 const POSTGRES_MIGRATIONS: &str = r#"
@@ -346,6 +352,9 @@ CREATE TABLE IF NOT EXISTS message_mappings (
     id BIGSERIAL PRIMARY KEY,
     matrix_event_id TEXT NOT NULL UNIQUE,
     feishu_message_id TEXT NOT NULL UNIQUE,
+    thread_id TEXT,
+    root_id TEXT,
+    parent_id TEXT,
     room_id TEXT NOT NULL,
     sender_mxid TEXT NOT NULL,
     sender_feishu_id TEXT NOT NULL,
@@ -369,4 +378,7 @@ CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(ma
 CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
 CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS thread_id TEXT;
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS root_id TEXT;
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS parent_id TEXT;
 "#;

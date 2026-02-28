@@ -8,7 +8,8 @@ use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use std::time::Duration;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::types::*;
@@ -19,6 +20,35 @@ const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
 const IMAGE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const FILE_SIZE_LIMIT: usize = 30 * 1024 * 1024;
 const RESOURCE_DOWNLOAD_LIMIT: usize = 100 * 1024 * 1024;
+const DEFAULT_MAX_RETRIES: u32 = 3;
+const DEFAULT_RETRY_BASE_MS: u64 = 250;
+
+#[derive(Debug, Clone, Copy)]
+enum FeishuErrorClass {
+    AuthFailed,
+    PermissionDenied,
+    RateLimited,
+    InvalidRequest,
+    ServerTransient,
+    Unknown,
+}
+
+impl FeishuErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthFailed => "auth_failed",
+            Self::PermissionDenied => "permission_denied",
+            Self::RateLimited => "rate_limited",
+            Self::InvalidRequest => "invalid_request",
+            Self::ServerTransient => "server_transient",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(self, Self::RateLimited | Self::ServerTransient)
+    }
+}
 
 #[derive(Clone)]
 pub struct FeishuClient {
@@ -255,39 +285,61 @@ impl FeishuClient {
             "{}/im/v1/messages/{}/resources/{}?type={}",
             FEISHU_API_BASE, message_id, file_key, resource_type
         );
+        let max_retries = self.max_retries();
+        let mut attempts = 0_u32;
+        let mut delay = Duration::from_millis(self.retry_base_delay_ms());
 
-        let response = self
-            .client
-            .get(url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .send()
-            .await
-            .context("failed to call im/v1/message-resource/get")?;
+        loop {
+            attempts += 1;
+            let response = self
+                .client
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", access_token))
+                .send()
+                .await
+                .context("failed to call im/v1/message-resource/get")?;
 
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .context("failed to read message resource response body")?
-            .to_vec();
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .context("failed to read message resource response body")?
+                .to_vec();
 
-        if !status.is_success() {
-            let detail = String::from_utf8_lossy(&body);
-            anyhow::bail!(
-                "Feishu im/v1/message-resource/get failed: status={} body={}",
-                status,
-                detail
-            );
+            if !status.is_success() {
+                let class = classify_http_error(status.as_u16());
+                if class.retryable() && attempts <= max_retries {
+                    warn!(
+                        "Retrying Feishu message resource request status={} class={} attempt={}/{}",
+                        status,
+                        class.as_str(),
+                        attempts,
+                        max_retries + 1
+                    );
+                    tokio::time::sleep(delay).await;
+                    delay = next_backoff(delay);
+                    continue;
+                }
+
+                let detail = String::from_utf8_lossy(&body);
+                anyhow::bail!(
+                    "Feishu im/v1/message-resource/get failed: class={} retryable={} status={} body={}",
+                    class.as_str(),
+                    class.retryable(),
+                    status,
+                    detail
+                );
+            }
+
+            if body.len() > RESOURCE_DOWNLOAD_LIMIT {
+                anyhow::bail!(
+                    "Feishu message resource exceeds {} bytes limit",
+                    RESOURCE_DOWNLOAD_LIMIT
+                );
+            }
+
+            return Ok(body);
         }
-
-        if body.len() > RESOURCE_DOWNLOAD_LIMIT {
-            anyhow::bail!(
-                "Feishu message resource exceeds {} bytes limit",
-                RESOURCE_DOWNLOAD_LIMIT
-            );
-        }
-
-        Ok(body)
     }
 
     pub async fn send_text_message(&mut self, chat_id: &str, content: &str) -> Result<String> {
@@ -466,30 +518,103 @@ impl FeishuClient {
     }
 
     async fn execute_json(&self, request: RequestBuilder) -> Result<Value> {
-        let response = request.send().await.context("request failed")?;
-        let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .context("failed to read response body")?;
+        let mut attempts = 0_u32;
+        let max_retries = self.max_retries();
+        let mut delay = Duration::from_millis(self.retry_base_delay_ms());
+        let mut current_request = request;
 
-        let json: Value = serde_json::from_slice(&body).with_context(|| {
-            format!(
-                "response is not valid JSON: status={} body={}",
-                status,
-                String::from_utf8_lossy(&body)
-            )
-        })?;
+        loop {
+            attempts += 1;
+            let next_request = current_request.try_clone();
+            let response = current_request.send().await.context("request failed")?;
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .context("failed to read response body")?;
 
-        if !status.is_success() {
-            anyhow::bail!(
-                "http status indicates failure: status={} body={}",
-                status,
-                json
-            );
+            let json: Value = serde_json::from_slice(&body).with_context(|| {
+                format!(
+                    "response is not valid JSON: status={} body={}",
+                    status,
+                    String::from_utf8_lossy(&body)
+                )
+            })?;
+
+            if !status.is_success() {
+                let class = classify_http_error(status.as_u16());
+                if class.retryable() && attempts <= max_retries {
+                    if let Some(retry_request) = next_request {
+                        warn!(
+                            "Retrying Feishu HTTP request after status={} class={} attempt={}/{}",
+                            status,
+                            class.as_str(),
+                            attempts,
+                            max_retries + 1
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = next_backoff(delay);
+                        current_request = retry_request;
+                        continue;
+                    }
+                }
+
+                anyhow::bail!(
+                    "Feishu HTTP request failed: class={} retryable={} status={} body={}",
+                    class.as_str(),
+                    class.retryable(),
+                    status,
+                    json
+                );
+            }
+
+            let envelope: FeishuApiEnvelope<Value> = serde_json::from_value(json.clone())
+                .context("failed to parse Feishu API response envelope")?;
+            if envelope.code != 0 {
+                let class = classify_api_error(envelope.code, &envelope.msg);
+                if class.retryable() && attempts <= max_retries {
+                    if let Some(retry_request) = next_request {
+                        warn!(
+                            "Retrying Feishu API request after code={} class={} attempt={}/{} msg={}",
+                            envelope.code,
+                            class.as_str(),
+                            attempts,
+                            max_retries + 1,
+                            envelope.msg
+                        );
+                        tokio::time::sleep(delay).await;
+                        delay = next_backoff(delay);
+                        current_request = retry_request;
+                        continue;
+                    }
+                }
+
+                anyhow::bail!(
+                    "Feishu API failed: class={} retryable={} code={} msg={} body={}",
+                    class.as_str(),
+                    class.retryable(),
+                    envelope.code,
+                    envelope.msg,
+                    json
+                );
+            }
+
+            return Ok(json);
         }
+    }
 
-        Ok(json)
+    fn max_retries(&self) -> u32 {
+        std::env::var("FEISHU_API_MAX_RETRIES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_MAX_RETRIES)
+    }
+
+    fn retry_base_delay_ms(&self) -> u64 {
+        std::env::var("FEISHU_API_RETRY_BASE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_RETRY_BASE_MS)
     }
 
     fn ensure_ok(api_name: &str, json: Value) -> Result<()> {
@@ -547,9 +672,54 @@ impl FeishuClient {
     }
 }
 
+fn classify_http_error(status: u16) -> FeishuErrorClass {
+    match status {
+        401 => FeishuErrorClass::AuthFailed,
+        403 => FeishuErrorClass::PermissionDenied,
+        429 => FeishuErrorClass::RateLimited,
+        500..=599 => FeishuErrorClass::ServerTransient,
+        400..=499 => FeishuErrorClass::InvalidRequest,
+        _ => FeishuErrorClass::Unknown,
+    }
+}
+
+fn classify_api_error(code: i64, msg: &str) -> FeishuErrorClass {
+    let normalized = msg.to_ascii_lowercase();
+
+    if matches!(code, 99991663 | 90013) || normalized.contains("rate") || normalized.contains("frequency")
+    {
+        return FeishuErrorClass::RateLimited;
+    }
+
+    if normalized.contains("token")
+        || normalized.contains("unauthorized")
+        || normalized.contains("tenant_access_token")
+    {
+        return FeishuErrorClass::AuthFailed;
+    }
+
+    if normalized.contains("permission") || normalized.contains("forbidden") {
+        return FeishuErrorClass::PermissionDenied;
+    }
+
+    if normalized.contains("invalid")
+        || normalized.contains("param")
+        || normalized.contains("bad request")
+    {
+        return FeishuErrorClass::InvalidRequest;
+    }
+
+    FeishuErrorClass::Unknown
+}
+
+fn next_backoff(current: Duration) -> Duration {
+    let next = current.as_millis().saturating_mul(2);
+    Duration::from_millis(next.min(8_000) as u64)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::FeishuClient;
+    use super::{FeishuClient, classify_api_error, classify_http_error};
     use sha2::Digest;
 
     #[test]
@@ -588,5 +758,25 @@ mod tests {
             .expect("decryption should succeed");
 
         assert_eq!(decrypted, "hello world");
+    }
+
+    #[test]
+    fn classify_http_error_marks_retryable_statuses() {
+        assert_eq!(classify_http_error(429).as_str(), "rate_limited");
+        assert_eq!(classify_http_error(503).as_str(), "server_transient");
+        assert!(!classify_http_error(400).retryable());
+    }
+
+    #[test]
+    fn classify_api_error_detects_common_categories() {
+        assert_eq!(
+            classify_api_error(99991663, "rate limited").as_str(),
+            "rate_limited"
+        );
+        assert_eq!(
+            classify_api_error(1, "permission denied").as_str(),
+            "permission_denied"
+        );
+        assert_eq!(classify_api_error(1, "invalid param").as_str(), "invalid_request");
     }
 }

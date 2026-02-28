@@ -72,24 +72,24 @@
 
 ## P1（增强稳定性和可运维性）
 
-9. [ ] T009：补齐群生命周期事件适配（成员进出群、群配置更新、群解散）
+9. [x] T009：补齐群生命周期事件适配（成员进出群、群配置更新、群解散）
 实施要点：处理 `im.chat.member.user.added_v1`、`im.chat.member.user.deleted_v1`、`im.chat.updated_v1`、`im.chat.disbanded_v1`；同步房间映射状态与 bridge metadata。
 验收标准：飞书侧群解散后，映射自动失效；群模式切换到 thread 时桥接策略自动更新。
 涉及文件：`src/feishu/service.rs` `src/bridge/portal.rs` `src/database/*`
 
-10. [ ] T010：落地 thread/topic 语义桥接
+10. [x] T010：落地 thread/topic 语义桥接
 实施要点：维护 `thread_id/root_id/parent_id` 映射；支持 Matrix 回复映射到飞书话题回复；支持从飞书 thread 回复回到 Matrix reply 关系。
 验收标准：双向回复链路可追踪，不再丢失上下文。
 涉及文件：`src/bridge/message_flow.rs` `src/database/models.rs` `src/feishu/types.rs`
 
-11. [ ] T011：数据库层补齐 PostgreSQL stores（或显式降级声明）
+11. [x] T011：数据库层补齐 PostgreSQL stores（或显式降级声明）
 实施要点：
 - 方案 A：实现 Postgres 对应 stores，移除 “stores 仅 sqlite” 限制
 - 方案 B：若短期不做，配置层禁止 postgres 并文档明确
 验收标准：配置与实际能力一致，不出现“可配不可用”。
 涉及文件：`src/database/mod.rs` `src/database/sqlite_stores.rs` `src/bridge/feishu_bridge.rs` `README*`
 
-12. [ ] T012：错误分类与重试退避
+12. [x] T012：错误分类与重试退避
 实施要点：按飞书 code 分类（鉴权失败、权限不足、频率限制、参数错误）；对可重试错误增加指数退避。
 验收标准：重试策略可配置，日志区分不可重试错误与可重试错误。
 涉及文件：`src/feishu/client.rs` `src/config/*` `src/util/*`

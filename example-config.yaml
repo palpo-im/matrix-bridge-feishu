@@ -29,7 +29,7 @@ appservice:
   port: 8080
   # Database configuration
   database:
-    # Database type (postgres, sqlite)
+    # Database type (currently only sqlite is supported by bridge stores)
     type: "sqlite"
     # Database connection URI
     uri: "sqlite:matrix-feishu.db"

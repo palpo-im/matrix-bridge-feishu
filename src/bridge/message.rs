@@ -9,6 +9,9 @@ pub struct BridgeMessage {
     pub msg_type: MessageType,
     pub timestamp: chrono::DateTime<chrono::Utc>,
     pub attachments: Vec<Attachment>,
+    pub thread_id: Option<String>,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,9 @@ impl BridgeMessage {
             msg_type: MessageType::Text,
             timestamp: chrono::Utc::now(),
             attachments: vec![],
+            thread_id: None,
+            root_id: None,
+            parent_id: None,
         }
     }
 
@@ -54,6 +60,9 @@ impl BridgeMessage {
             msg_type: MessageType::RichText,
             timestamp: chrono::Utc::now(),
             attachments: vec![],
+            thread_id: None,
+            root_id: None,
+            parent_id: None,
         }
     }
 
@@ -66,6 +75,9 @@ impl BridgeMessage {
             msg_type: MessageType::Card,
             timestamp: chrono::Utc::now(),
             attachments: vec![],
+            thread_id: None,
+            root_id: None,
+            parent_id: None,
         }
     }
 }

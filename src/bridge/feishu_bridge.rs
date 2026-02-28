@@ -17,7 +17,7 @@ use url::Url;
 
 use super::MatrixEvent;
 use super::message::{BridgeMessage, MessageType};
-use super::portal::BridgePortal;
+use super::portal::{BridgePortal, RoomType};
 use super::puppet::BridgePuppet;
 use super::user::BridgeUser;
 use crate::bridge::{
@@ -60,6 +60,13 @@ impl FeishuBridge {
         let db_uri = &config.appservice.database.uri;
         let max_open = config.appservice.database.max_open_conns;
         let max_idle = config.appservice.database.max_idle_conns;
+
+        if !db_type.eq_ignore_ascii_case("sqlite") {
+            anyhow::bail!(
+                "database type '{}' is not supported for bridge stores; please use sqlite",
+                db_type
+            );
+        }
 
         let db = Database::connect(db_type, db_uri, max_open, max_idle).await?;
         db.run_migrations().await?;
@@ -308,14 +315,47 @@ impl FeishuBridge {
             .await;
         intent.ensure_registered().await?;
 
+        let mut reply_to_matrix_event_id = None;
+        if let Some(parent_id) = message.parent_id.as_deref() {
+            if let Some(parent_mapping) = self
+                .stores
+                .message_store()
+                .get_message_by_feishu_id(parent_id)
+                .await?
+            {
+                reply_to_matrix_event_id = Some(parent_mapping.matrix_event_id);
+            } else {
+                debug!(
+                    "No Matrix mapping found for Feishu parent message {}",
+                    parent_id
+                );
+            }
+        }
+
         let mut primary_matrix_event_id = None;
         if !message.content.trim().is_empty() {
-            let event_id = intent.send_text(&portal.mxid, &message.content).await?;
+            let event_id = self
+                .send_matrix_text_message(
+                    &intent,
+                    &portal.mxid,
+                    &message.content,
+                    reply_to_matrix_event_id.as_deref(),
+                )
+                .await?;
             primary_matrix_event_id = Some(event_id);
         }
 
         let attachment_event_ids = self
-            .forward_feishu_attachments_to_matrix(&intent, &portal.mxid, &message)
+            .forward_feishu_attachments_to_matrix(
+                &intent,
+                &portal.mxid,
+                &message,
+                if primary_matrix_event_id.is_none() {
+                    reply_to_matrix_event_id.as_deref()
+                } else {
+                    None
+                },
+            )
             .await?;
         if primary_matrix_event_id.is_none() {
             primary_matrix_event_id = attachment_event_ids.first().cloned();
@@ -328,6 +368,11 @@ impl FeishuBridge {
                 portal.mxid.clone(),
                 portal.bridge_info.bridgebot.clone(),
                 message.sender,
+            )
+            .with_threading(
+                message.thread_id.clone(),
+                message.root_id.clone(),
+                message.parent_id.clone(),
             );
             if let Err(err) = self
                 .stores
@@ -385,6 +430,274 @@ impl FeishuBridge {
             warn!(
                 "Failed to delete recalled message mapping {} (Feishu {}): {}",
                 mapping.id, feishu_message_id, err
+            );
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_feishu_chat_member_added(
+        &self,
+        feishu_chat_id: &str,
+        user_ids: &[String],
+    ) -> anyhow::Result<()> {
+        info!(
+            "Handling Feishu member added event: chat={} users={}",
+            feishu_chat_id,
+            user_ids.join(",")
+        );
+
+        let Some(mapping) = self
+            .stores
+            .room_store()
+            .get_room_by_feishu_id(feishu_chat_id)
+            .await?
+        else {
+            debug!(
+                "No room mapping found for member added event in chat {}",
+                feishu_chat_id
+            );
+            return Ok(());
+        };
+
+        if !user_ids.is_empty() {
+            let notice = format!("Feishu members joined: {}", user_ids.join(", "));
+            if let Err(err) = self.bot_intent.send_notice(&mapping.matrix_room_id, &notice).await {
+                warn!(
+                    "Failed to send Matrix join notice for Feishu chat {}: {}",
+                    feishu_chat_id, err
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_feishu_chat_member_deleted(
+        &self,
+        feishu_chat_id: &str,
+        user_ids: &[String],
+    ) -> anyhow::Result<()> {
+        info!(
+            "Handling Feishu member deleted event: chat={} users={}",
+            feishu_chat_id,
+            user_ids.join(",")
+        );
+
+        let Some(mapping) = self
+            .stores
+            .room_store()
+            .get_room_by_feishu_id(feishu_chat_id)
+            .await?
+        else {
+            debug!(
+                "No room mapping found for member deleted event in chat {}",
+                feishu_chat_id
+            );
+            return Ok(());
+        };
+
+        if !user_ids.is_empty() {
+            let notice = format!("Feishu members left: {}", user_ids.join(", "));
+            if let Err(err) = self.bot_intent.send_notice(&mapping.matrix_room_id, &notice).await {
+                warn!(
+                    "Failed to send Matrix leave notice for Feishu chat {}: {}",
+                    feishu_chat_id, err
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_feishu_chat_updated(
+        &self,
+        feishu_chat_id: &str,
+        chat_name: Option<String>,
+        chat_mode: Option<String>,
+        chat_type: Option<String>,
+    ) -> anyhow::Result<()> {
+        info!(
+            "Handling Feishu chat updated event: chat={} name={:?} mode={:?} type={:?}",
+            feishu_chat_id, chat_name, chat_mode, chat_type
+        );
+
+        let Some(mut mapping) = self
+            .stores
+            .room_store()
+            .get_room_by_feishu_id(feishu_chat_id)
+            .await?
+        else {
+            debug!(
+                "No room mapping found for chat updated event in chat {}",
+                feishu_chat_id
+            );
+            return Ok(());
+        };
+
+        let normalized_name = chat_name.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let normalized_mode = chat_mode.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let normalized_type = chat_type.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let mut changed = false;
+        if let Some(name) = &normalized_name {
+            if mapping.feishu_chat_name.as_deref() != Some(name.as_str()) {
+                mapping.feishu_chat_name = Some(name.clone());
+                changed = true;
+            }
+        }
+
+        if let Some(mode) = &normalized_mode {
+            if mapping.feishu_chat_type != *mode {
+                mapping.feishu_chat_type = mode.clone();
+                changed = true;
+            }
+        } else if let Some(chat_type) = &normalized_type {
+            if mapping.feishu_chat_type != *chat_type {
+                mapping.feishu_chat_type = chat_type.clone();
+                changed = true;
+            }
+        }
+
+        if changed {
+            mapping.updated_at = Utc::now();
+            self.stores.room_store().update_room_mapping(&mapping).await?;
+        }
+
+        let mut portals = self.portals_by_mxid.write().await;
+        if let Some(portal) = portals.get_mut(&mapping.matrix_room_id) {
+            if let Some(name) = normalized_name {
+                portal.name = name;
+            }
+            if let Some(mode) = &normalized_mode {
+                portal
+                    .bridge_info
+                    .channel
+                    .insert("chat_mode".to_string(), Value::String(mode.clone()));
+                portal.room_type = room_type_from_chat_type(normalized_type.as_deref());
+            }
+            if let Some(kind) = normalized_type {
+                portal
+                    .bridge_info
+                    .channel
+                    .insert("chat_type".to_string(), Value::String(kind.clone()));
+                portal.room_type = room_type_from_chat_type(Some(&kind));
+            }
+            portal.last_event = Some("im.chat.updated_v1".to_string());
+        }
+        drop(portals);
+
+        if let Some(mode) = &normalized_mode {
+            let notice = if mode.eq_ignore_ascii_case("thread") {
+                "Feishu chat mode changed to thread; bridge reply strategy is now thread mode."
+            } else {
+                "Feishu chat mode changed; bridge reply strategy switched to non-thread mode."
+            };
+            if let Err(err) = self
+                .bot_intent
+                .send_notice(&mapping.matrix_room_id, notice)
+                .await
+            {
+                warn!(
+                    "Failed to send chat mode update notice for chat {}: {}",
+                    feishu_chat_id, err
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_feishu_chat_disbanded(
+        &self,
+        feishu_chat_id: &str,
+    ) -> anyhow::Result<()> {
+        info!("Handling Feishu chat disbanded event: chat={}", feishu_chat_id);
+
+        let mapping = self
+            .stores
+            .room_store()
+            .get_room_by_feishu_id(feishu_chat_id)
+            .await?;
+
+        let Some(mapping) = mapping else {
+            debug!(
+                "No room mapping found for disbanded chat {}; cleaning memory cache only",
+                feishu_chat_id
+            );
+            if let Some(mxid) = self
+                .portals_by_feishu_room
+                .write()
+                .await
+                .remove(feishu_chat_id)
+            {
+                self.portals_by_mxid.write().await.remove(&mxid);
+            }
+            return Ok(());
+        };
+
+        let historical_mappings = self
+            .stores
+            .message_store()
+            .get_messages_by_room(&mapping.matrix_room_id, Some(2000))
+            .await?;
+        for message in historical_mappings {
+            if let Err(err) = self
+                .stores
+                .message_store()
+                .delete_message_mapping(message.id)
+                .await
+            {
+                warn!(
+                    "Failed to delete message mapping {} while disbanding chat {}: {}",
+                    message.id, feishu_chat_id, err
+                );
+            }
+        }
+
+        self.stores
+            .room_store()
+            .delete_room_mapping(mapping.id)
+            .await?;
+
+        self.portals_by_feishu_room.write().await.remove(feishu_chat_id);
+        self.portals_by_mxid
+            .write()
+            .await
+            .remove(&mapping.matrix_room_id);
+
+        if let Err(err) = self
+            .bot_intent
+            .send_notice(
+                &mapping.matrix_room_id,
+                "Feishu chat has been disbanded; bridge mapping was removed automatically.",
+            )
+            .await
+        {
+            warn!(
+                "Failed to send disband notice to Matrix room {}: {}",
+                mapping.matrix_room_id, err
             );
         }
 
@@ -614,7 +927,35 @@ impl FeishuBridge {
             msg_type,
             timestamp,
             attachments: vec![],
+            thread_id: None,
+            root_id: None,
+            parent_id: None,
         })
+    }
+
+    async fn send_matrix_text_message(
+        &self,
+        intent: &Intent,
+        matrix_room_id: &str,
+        body: &str,
+        reply_to_matrix_event_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if let Some(reply_event_id) = reply_to_matrix_event_id {
+            let content = json!({
+                "msgtype": "m.text",
+                "body": body,
+                "m.relates_to": {
+                    "m.in_reply_to": {
+                        "event_id": reply_event_id
+                    }
+                }
+            });
+            return intent
+                .send_event(matrix_room_id, "m.room.message", &content)
+                .await;
+        }
+
+        intent.send_text(matrix_room_id, body).await
     }
 
     async fn forward_feishu_attachments_to_matrix(
@@ -622,15 +963,27 @@ impl FeishuBridge {
         intent: &Intent,
         matrix_room_id: &str,
         message: &BridgeMessage,
+        reply_to_matrix_event_id: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
         let mut event_ids = Vec::new();
+        let mut pending_reply_target = reply_to_matrix_event_id.map(ToOwned::to_owned);
 
         for attachment in &message.attachments {
+            let current_reply_target = pending_reply_target.as_deref();
             match self
-                .forward_single_feishu_attachment(intent, matrix_room_id, &message.id, attachment)
+                .forward_single_feishu_attachment(
+                    intent,
+                    matrix_room_id,
+                    &message.id,
+                    attachment,
+                    current_reply_target,
+                )
                 .await
             {
-                Ok(event_id) => event_ids.push(event_id),
+                Ok(event_id) => {
+                    event_ids.push(event_id);
+                    pending_reply_target = None;
+                }
                 Err(err) => warn!(
                     "Failed to forward Feishu attachment {} for message {}: {}",
                     attachment.url, message.id, err
@@ -647,6 +1000,7 @@ impl FeishuBridge {
         matrix_room_id: &str,
         feishu_message_id: &str,
         attachment: &super::message::Attachment,
+        reply_to_matrix_event_id: Option<&str>,
     ) -> anyhow::Result<String> {
         let (kind, key) = parse_feishu_attachment_url(&attachment.url)
             .ok_or_else(|| anyhow::anyhow!("invalid feishu attachment url: {}", attachment.url))?;
@@ -684,7 +1038,7 @@ impl FeishuBridge {
             .upload_media(bytes.clone(), &mime_type, Some(&file_name))
             .await?;
 
-        let content = json!({
+        let mut content = json!({
             "msgtype": matrix_msgtype_for_kind(kind),
             "body": file_name,
             "url": mxc.as_str(),
@@ -693,6 +1047,13 @@ impl FeishuBridge {
                 "size": bytes.len() as u64
             }
         });
+        if let Some(reply_event_id) = reply_to_matrix_event_id {
+            content["m.relates_to"] = json!({
+                "m.in_reply_to": {
+                    "event_id": reply_event_id
+                }
+            });
+        }
 
         intent
             .send_event(matrix_room_id, "m.room.message", &content)
@@ -748,6 +1109,13 @@ fn default_mime_for_kind(kind: &str) -> &'static str {
         "audio" => "audio/ogg",
         "video" => "video/mp4",
         _ => "application/octet-stream",
+    }
+}
+
+fn room_type_from_chat_type(chat_type: Option<&str>) -> RoomType {
+    match chat_type {
+        Some("p2p") | Some("private") | Some("single") => RoomType::Direct,
+        _ => RoomType::Group,
     }
 }
 

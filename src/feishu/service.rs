@@ -29,6 +29,20 @@ struct RecalledMessage {
     chat_id: String,
 }
 
+#[derive(Debug, Clone)]
+struct ChatMemberChangedEvent {
+    chat_id: String,
+    user_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChatUpdatedEvent {
+    chat_id: String,
+    chat_name: Option<String>,
+    chat_mode: Option<String>,
+    chat_type: Option<String>,
+}
+
 impl FeishuService {
     pub fn new(
         app_id: String,
@@ -221,6 +235,75 @@ impl FeishuService {
                 res.status_code(StatusCode::OK);
                 res.render("accepted");
             }
+            "im.chat.member.user.added_v1" => {
+                let event = self
+                    .webhook_event_to_chat_member_change(&payload)
+                    .context("failed to parse member added event")?;
+                let chat_id = event.chat_id.clone();
+                self.queue_chat_task(chat_id.clone(), async move {
+                    if let Err(err) = bridge
+                        .handle_feishu_chat_member_added(&chat_id, &event.user_ids)
+                        .await
+                    {
+                        error!("Failed to process Feishu member added event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
+            "im.chat.member.user.deleted_v1" => {
+                let event = self
+                    .webhook_event_to_chat_member_change(&payload)
+                    .context("failed to parse member deleted event")?;
+                let chat_id = event.chat_id.clone();
+                self.queue_chat_task(chat_id.clone(), async move {
+                    if let Err(err) = bridge
+                        .handle_feishu_chat_member_deleted(&chat_id, &event.user_ids)
+                        .await
+                    {
+                        error!("Failed to process Feishu member deleted event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
+            "im.chat.updated_v1" => {
+                let event = self
+                    .webhook_event_to_chat_updated(&payload)
+                    .context("failed to parse chat updated event")?;
+                let chat_id = event.chat_id.clone();
+                self.queue_chat_task(chat_id.clone(), async move {
+                    if let Err(err) = bridge
+                        .handle_feishu_chat_updated(
+                            &chat_id,
+                            event.chat_name,
+                            event.chat_mode,
+                            event.chat_type,
+                        )
+                        .await
+                    {
+                        error!("Failed to process Feishu chat updated event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
+            "im.chat.disbanded_v1" => {
+                let chat_id = self
+                    .webhook_event_to_chat_disbanded(&payload)
+                    .context("failed to parse chat disbanded event")?;
+                self.queue_chat_task(chat_id.clone(), async move {
+                    if let Err(err) = bridge.handle_feishu_chat_disbanded(&chat_id).await {
+                        error!("Failed to process Feishu chat disbanded event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
             _ => {
                 debug!("Ignoring unsupported Feishu event type: {}", event_type);
                 res.status_code(StatusCode::OK);
@@ -323,6 +406,18 @@ impl FeishuService {
             .get("create_time")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let parent_id = message
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let thread_id = message
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let root_id = message
+            .get("root_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
 
         let sender = event
             .pointer("/sender/sender_id/user_id")
@@ -422,6 +517,9 @@ impl FeishuService {
             msg_type: message_type,
             timestamp: parse_event_timestamp(create_time),
             attachments,
+            thread_id,
+            root_id,
+            parent_id,
         })
     }
 
@@ -458,6 +556,88 @@ impl FeishuService {
             message_id,
             chat_id,
         })
+    }
+
+    fn webhook_event_to_chat_member_change(&self, payload: &Value) -> Result<ChatMemberChangedEvent> {
+        let event = payload
+            .get("event")
+            .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
+
+        let chat_id = pick_first_string(
+            event,
+            &[
+                "/chat_id",
+                "/chat/chat_id",
+                "/open_chat_id",
+                "/chat/open_chat_id",
+            ],
+        )
+        .ok_or_else(|| anyhow::anyhow!("missing chat_id in member change event"))?;
+
+        let mut user_ids = Vec::new();
+        collect_user_ids(event.pointer("/users"), &mut user_ids);
+        collect_user_ids(event.pointer("/added_users"), &mut user_ids);
+        collect_user_ids(event.pointer("/deleted_users"), &mut user_ids);
+        if let Some(single_user) = pick_first_string(
+            event,
+            &[
+                "/operator_id/user_id",
+                "/operator_id/open_id",
+                "/user_id/user_id",
+                "/user_id/open_id",
+            ],
+        ) {
+            user_ids.push(single_user);
+        }
+        user_ids.sort();
+        user_ids.dedup();
+
+        Ok(ChatMemberChangedEvent { chat_id, user_ids })
+    }
+
+    fn webhook_event_to_chat_updated(&self, payload: &Value) -> Result<ChatUpdatedEvent> {
+        let event = payload
+            .get("event")
+            .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
+
+        let chat_id = pick_first_string(
+            event,
+            &[
+                "/chat_id",
+                "/chat/chat_id",
+                "/open_chat_id",
+                "/chat/open_chat_id",
+            ],
+        )
+        .ok_or_else(|| anyhow::anyhow!("missing chat_id in chat updated event"))?;
+
+        let chat_name = pick_first_string(event, &["/name", "/chat/name", "/chat_info/name"]);
+        let chat_mode = pick_first_string(event, &["/chat_mode", "/chat/chat_mode"]);
+        let chat_type = pick_first_string(event, &["/chat_type", "/chat/chat_type"]);
+
+        Ok(ChatUpdatedEvent {
+            chat_id,
+            chat_name,
+            chat_mode,
+            chat_type,
+        })
+    }
+
+    fn webhook_event_to_chat_disbanded(&self, payload: &Value) -> Result<String> {
+        let event = payload
+            .get("event")
+            .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
+
+        pick_first_string(
+            event,
+            &[
+                "/chat_id",
+                "/chat/chat_id",
+                "/open_chat_id",
+                "/chat/open_chat_id",
+            ],
+        )
+        .ok_or_else(|| anyhow::anyhow!("missing chat_id in chat disbanded event"))
     }
 
     pub async fn get_user(&self, user_id: &str) -> Result<FeishuUser> {
@@ -665,6 +845,36 @@ fn build_attachment(kind: &str, key: &str, mime_type: &str) -> Attachment {
     }
 }
 
+fn pick_first_string(root: &Value, pointers: &[&str]) -> Option<String> {
+    pointers.iter().find_map(|pointer| {
+        root.pointer(pointer)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn collect_user_ids(source: Option<&Value>, output: &mut Vec<String>) {
+    let Some(value) = source else {
+        return;
+    };
+
+    if let Some(entries) = value.as_array() {
+        for entry in entries {
+            if let Some(id) = pick_first_string(
+                entry,
+                &["/user_id", "/open_id", "/id/user_id", "/id/open_id"],
+            ) {
+                output.push(id);
+            }
+        }
+        return;
+    }
+
+    if let Some(id) = pick_first_string(value, &["/user_id", "/open_id"]) {
+        output.push(id);
+    }
+}
+
 struct FeishuWebhookHandler {
     service: FeishuService,
     bridge: FeishuBridge,
@@ -701,7 +911,18 @@ async fn feishu_health(res: &mut Response) {
 mod tests {
     use serde_json::json;
 
-    use super::parse_feishu_message_content;
+    use super::{FeishuService, parse_feishu_message_content};
+
+    fn build_service() -> FeishuService {
+        FeishuService::new(
+            "app_id".to_string(),
+            "app_secret".to_string(),
+            "127.0.0.1:8081".to_string(),
+            "listen_secret".to_string(),
+            Some("encrypt_key".to_string()),
+            Some("verification_token".to_string()),
+        )
+    }
 
     #[test]
     fn parse_feishu_message_content_accepts_json_string() {
@@ -719,5 +940,48 @@ mod tests {
             parsed.get("text").and_then(|value| value.as_str()),
             Some("hello")
         );
+    }
+
+    #[test]
+    fn parse_chat_member_change_event_extracts_chat_and_users() {
+        let service = build_service();
+        let payload = json!({
+            "event": {
+                "chat_id": "oc_chat",
+                "users": [
+                    {"user_id": "u_1"},
+                    {"open_id": "ou_2"}
+                ]
+            }
+        });
+
+        let parsed = service
+            .webhook_event_to_chat_member_change(&payload)
+            .expect("member change should parse");
+        assert_eq!(parsed.chat_id, "oc_chat");
+        assert_eq!(parsed.user_ids, vec!["ou_2".to_string(), "u_1".to_string()]);
+    }
+
+    #[test]
+    fn parse_chat_updated_event_extracts_mode() {
+        let service = build_service();
+        let payload = json!({
+            "event": {
+                "chat": {
+                    "chat_id": "oc_chat",
+                    "name": "Bridge Chat",
+                    "chat_mode": "thread",
+                    "chat_type": "group"
+                }
+            }
+        });
+
+        let parsed = service
+            .webhook_event_to_chat_updated(&payload)
+            .expect("chat updated should parse");
+        assert_eq!(parsed.chat_id, "oc_chat");
+        assert_eq!(parsed.chat_name.as_deref(), Some("Bridge Chat"));
+        assert_eq!(parsed.chat_mode.as_deref(), Some("thread"));
+        assert_eq!(parsed.chat_type.as_deref(), Some("group"));
     }
 }

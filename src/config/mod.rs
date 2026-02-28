@@ -115,6 +115,14 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
+        let db_type = self.appservice.database.r#type.trim().to_ascii_lowercase();
+        if db_type != "sqlite" {
+            anyhow::bail!(
+                "appservice.database.type='{}' is not supported in current bridge build; use 'sqlite'",
+                self.appservice.database.r#type
+            );
+        }
+
         let has_wildcard = self.bridge.permissions.contains_key("*");
         let has_example_domain = self.bridge.permissions.contains_key("example.com");
         let has_example_user = self.bridge.permissions.contains_key("@admin:example.com");

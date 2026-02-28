@@ -45,6 +45,9 @@ pub fn format_feishu_to_matrix(message: FeishuMessage) -> BridgeMessage {
         msg_type,
         timestamp: message.create_time,
         attachments,
+        thread_id: message.thread_id,
+        root_id: message.root_id,
+        parent_id: message.parent_id,
     }
 }
 

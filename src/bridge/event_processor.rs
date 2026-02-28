@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::database::{
     EventStore, MessageMapping, MessageStore, ProcessedEvent, RoomMapping, RoomStore,
 };
-use crate::feishu::FeishuService;
+use crate::feishu::{FeishuMessageSendData, FeishuService};
 
 #[derive(Debug, Clone)]
 pub struct MatrixEvent {
@@ -146,23 +146,35 @@ impl MatrixEventProcessor {
             return Ok(());
         }
 
-        let mut primary_feishu_message_id = self.send_outbound_message(&mapping, &outbound).await?;
+        let mut primary_feishu_message = self.send_outbound_message(&mapping, &outbound).await?;
 
         let attachment_message_ids = self
             .forward_attachments_to_feishu(&mapping, &outbound.attachments)
             .await?;
-        if primary_feishu_message_id.is_none() {
-            primary_feishu_message_id = attachment_message_ids.first().cloned();
+        if primary_feishu_message.is_none() {
+            primary_feishu_message = attachment_message_ids.first().cloned().map(|message_id| {
+                FeishuMessageSendData {
+                    message_id,
+                    root_id: None,
+                    parent_id: None,
+                    thread_id: None,
+                }
+            });
         }
 
-        if let (Some(event_id), Some(feishu_message_id)) = (&event.event_id, primary_feishu_message_id)
+        if let (Some(event_id), Some(feishu_message)) = (&event.event_id, primary_feishu_message)
         {
             let link = MessageMapping::new(
                 event_id.clone(),
-                feishu_message_id,
+                feishu_message.message_id,
                 event.room_id.clone(),
                 event.sender.clone(),
                 "matrix".to_string(),
+            )
+            .with_threading(
+                feishu_message.thread_id,
+                feishu_message.root_id,
+                feishu_message.parent_id,
             );
             if let Err(err) = self.message_store.create_message_mapping(&link).await {
                 warn!(
@@ -184,13 +196,14 @@ impl MatrixEventProcessor {
         &self,
         mapping: &RoomMapping,
         outbound: &OutboundFeishuMessage,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<Option<FeishuMessageSendData>> {
         if outbound.content.trim().is_empty() {
             return Ok(None);
         }
 
         let (msg_type, content) = build_feishu_content_payload(&outbound.msg_type, &outbound.content)?;
         let uuid = Some(Uuid::new_v4().to_string());
+        let reply_in_thread = mapping.feishu_chat_type.eq_ignore_ascii_case("thread");
 
         if self.config.bridge.bridge_matrix_reply {
             if let Some(reply_to) = &outbound.reply_to {
@@ -201,11 +214,11 @@ impl MatrixEventProcessor {
                             &reply_mapping.feishu_message_id,
                             &msg_type,
                             content,
-                            true,
+                            reply_in_thread,
                             uuid,
                         )
                         .await?;
-                    return Ok(Some(response.message_id));
+                    return Ok(Some(response));
                 }
             }
         }
@@ -221,7 +234,7 @@ impl MatrixEventProcessor {
             )
             .await?;
 
-        Ok(Some(response.message_id))
+        Ok(Some(response))
     }
 
     async fn handle_edit_message(
