@@ -4,6 +4,13 @@
 # - MATRIX_BRIDGE_FEISHU_DB_TYPE / MATRIX_BRIDGE_FEISHU_DB_URI
 # - MATRIX_BRIDGE_FEISHU_AS_TOKEN / MATRIX_BRIDGE_FEISHU_HS_TOKEN
 # - MATRIX_BRIDGE_FEISHU_BRIDGE_APP_ID / MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET
+# - MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN / WRITE_TOKEN / DELETE_TOKEN
+# - FEISHU_API_MAX_RETRIES / FEISHU_API_RETRY_BASE_MS
+#
+# Production baseline recommendations:
+# - Use an absolute SQLite path on persistent storage (example below).
+# - Keep webhook/api timeouts at or above stress-script recommendations.
+# - Backup SQLite before every upgrade/rollback window.
 
 # Homeserver configuration
 homeserver:
@@ -36,7 +43,7 @@ appservice:
   database:
     # Database type (currently only sqlite is supported by bridge stores)
     type: "sqlite"
-    # Database connection URI
+    # Database connection URI (production example: sqlite:/var/lib/matrix-bridge-feishu/matrix-feishu.db)
     uri: "sqlite:matrix-feishu.db"
     # Maximum open connections
     max_open_conns: 20
@@ -128,8 +135,10 @@ bridge:
   # Remove stale user mappings older than this TTL in hours
   user_mapping_stale_ttl_hours: 720
   # Webhook timeout in seconds
+  # Recommended: max(30, ceil(p99_ms * 3 / 1000)) from stress test output
   webhook_timeout: 30
   # Feishu API timeout in seconds
+  # Recommended: max(60, ceil(p99_ms * 4 / 1000)) from stress test output
   api_timeout: 60
   # Enable Feishu rich text formatting
   enable_rich_text: true

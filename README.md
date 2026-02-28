@@ -265,6 +265,38 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
+### Production Deployment Template
+
+Recommended host layout:
+
+```text
+/opt/matrix-bridge-feishu/
+  bin/matrix-appservice-feishu
+  config/config.yaml
+  data/matrix-feishu.db
+  logs/
+```
+
+Recommended environment variables (service-level):
+
+```bash
+CONFIG_PATH=/opt/matrix-bridge-feishu/config/config.yaml
+MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN=<read-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN=<write-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN=<delete-token>
+FEISHU_API_MAX_RETRIES=2
+FEISHU_API_RETRY_BASE_MS=250
+RUST_LOG=info
+```
+
+Pre-deploy gate:
+
+```powershell
+pwsh ./scripts/release-check.ps1 `
+  -ConfigPath ./config.yaml `
+  -SubscribedEvents "im.message.receive_v1,im.message.recalled_v1,im.chat.member.user.added_v1,im.chat.member.user.deleted_v1,im.chat.updated_v1,im.chat.disbanded_v1"
+```
+
 ## Monitoring
 
 ### Health Checks
@@ -322,6 +354,39 @@ Recommended starting production parameters (adjust from script output):
 3. **Database Error**: Check database connection and permissions
 4. **Message Not Bridged**: Check webhook configuration and URL
 5. **Encryption Error**: Verify encryption key and verification token
+
+### 10-Min Triage Flow
+
+1. Check liveness and auth: `/health`, `/admin/status`, `/admin/mappings`.
+2. Check queue pressure: `bridge_queue_depth`, `bridge_queue_depth_max`, `bridge_processing_duration_ms_*`.
+3. Check delivery failures: `bridge_outbound_failures_total_by_api_code` and recent logs with `trace_id`.
+4. Check dead letters: `/admin/dead-letters?status=pending` and replay a single sample.
+5. Run deep release checks: `release-check.ps1` without skip flags.
+
+### Common Error Map
+
+| Signal | Meaning | Action |
+|---|---|---|
+| HTTP `401` / `403` from Feishu API | credential/scope issue | verify `app_id/app_secret`, app scopes, tenant install state |
+| HTTP `429` or Feishu code `99991663`/`90013` | rate limited | reduce concurrency, increase retry backoff (`FEISHU_API_RETRY_BASE_MS`) |
+| Feishu token-related message (`tenant_access_token invalid`) | auth token invalid/expired | rotate app secret, re-check app credentials and server clock |
+| Webhook `invalid signature` / `missing signature` | callback signing mismatch | verify `listen_secret`, `X-Lark-*` headers, reverse proxy pass-through |
+| SQLite `quick_check` not `ok` | db integrity risk | stop service and restore latest db backup |
+
+### Rollback Procedure
+
+1. Stop service (`systemctl stop matrix-appservice-feishu`).
+2. Backup current DB before rollback:
+   ```bash
+   sqlite3 /opt/matrix-bridge-feishu/data/matrix-feishu.db ".backup '/opt/matrix-bridge-feishu/data/matrix-feishu.db.pre_rollback'"
+   ```
+3. Restore previous binary and config (`bin/` + `config/`).
+4. If schema/data regressed, restore last known-good DB snapshot.
+5. Start service and verify:
+   - `/health` is `200`
+   - `/admin/status` is `running`
+   - no spike in `bridge_outbound_failures_total`
+6. Replay pending dead letters after stability is confirmed.
 
 ### Focused Playbook
 

@@ -150,6 +150,62 @@ pwsh ./scripts/release-check.ps1 `
 - 事件订阅校验：飞书必需事件列表比对
 - 数据健康校验：SQLite quick_check + 关键表存在性与计数检查
 
+## 生产部署模板
+
+推荐目录结构：
+
+```text
+/opt/matrix-bridge-feishu/
+  bin/matrix-appservice-feishu
+  config/config.yaml
+  data/matrix-feishu.db
+  logs/
+```
+
+推荐服务级环境变量：
+
+```bash
+CONFIG_PATH=/opt/matrix-bridge-feishu/config/config.yaml
+MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN=<read-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN=<write-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN=<delete-token>
+FEISHU_API_MAX_RETRIES=2
+FEISHU_API_RETRY_BASE_MS=250
+RUST_LOG=info
+```
+
+发布前建议流程：先跑 `release-check.ps1`，再灰度启动，最后观察 `/metrics` 中队列深度与失败率。
+
+## 故障诊断流程（10 分钟）
+
+1. 先看可用性与鉴权：`/health`、`/admin/status`、`/admin/mappings`。
+2. 看队列与时延：`bridge_queue_depth`、`bridge_queue_depth_max`、`bridge_processing_duration_ms_*`。
+3. 看发送失败：`bridge_outbound_failures_total_by_api_code` + `trace_id` 日志串联。
+4. 看 dead-letter：`/admin/dead-letters?status=pending`，抽样回放。
+5. 运行完整发布检查：`release-check.ps1`（不要加 skip 参数）。
+
+## 常见错误码速查
+
+| 信号 | 含义 | 处理建议 |
+|---|---|---|
+| Feishu API HTTP `401/403` | 凭据或权限不足 | 检查 `app_id/app_secret`、应用权限、租户安装状态 |
+| HTTP `429` 或 Feishu `99991663` / `90013` | 触发限流 | 降低并发，增大 `FEISHU_API_RETRY_BASE_MS` |
+| `tenant_access_token invalid` | token 无效/过期 | 轮换密钥并校验服务器时钟 |
+| webhook `invalid signature` / `missing signature` | 回调签名不匹配 | 校验 `listen_secret` 与 `X-Lark-*` 头是否被代理透传 |
+| SQLite `quick_check` 非 `ok` | 数据库完整性风险 | 停服并恢复最近可用备份 |
+
+## 回滚步骤
+
+1. 停止服务：`systemctl stop matrix-appservice-feishu`。
+2. 回滚前先备份当前库：
+   ```bash
+   sqlite3 /opt/matrix-bridge-feishu/data/matrix-feishu.db ".backup '/opt/matrix-bridge-feishu/data/matrix-feishu.db.pre_rollback'"
+   ```
+3. 恢复上一版本二进制与配置文件。
+4. 如涉及 schema/数据回退，恢复上一份已验证备份库。
+5. 启动并核验：`/health`、`/admin/status`、失败率指标。
+6. 服务稳定后，再回放 pending dead-letter。
+
 ## 常用开发命令
 
 ```bash
