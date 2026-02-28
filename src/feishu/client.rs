@@ -781,6 +781,26 @@ mod tests {
     }
 
     #[test]
+    fn verify_webhook_signature_rejects_invalid_signature() {
+        let client = FeishuClient::new(
+            "app".to_string(),
+            "secret".to_string(),
+            Some("encrypt_key".to_string()),
+            None,
+        );
+        let valid = client
+            .verify_webhook_signature(
+                "encrypt_key",
+                "1700000000",
+                "abc123",
+                r#"{"encrypt":"xxx"}"#,
+                "deadbeef",
+            )
+            .expect("signature validation should not fail");
+        assert!(!valid);
+    }
+
+    #[test]
     fn decrypt_webhook_content_uses_aes_256_cbc() {
         let client = FeishuClient::new(
             "app".to_string(),

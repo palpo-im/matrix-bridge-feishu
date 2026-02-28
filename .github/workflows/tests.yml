@@ -17,3 +17,5 @@ jobs:
         run: cargo check -p matrix-bridge-feishu
       - name: Cargo test
         run: cargo test -p matrix-bridge-feishu
+      - name: Cargo integration test (mock_feishu_matrix)
+        run: cargo test -p matrix-bridge-feishu --test mock_feishu_matrix
