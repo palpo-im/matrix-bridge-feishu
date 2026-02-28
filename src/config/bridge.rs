@@ -74,8 +74,21 @@ pub struct BridgeConfig {
     /// Rate limiting
     #[serde(default)]
     pub message_limit: u32,
+    /// Rate limit window in milliseconds
     #[serde(default)]
     pub message_cooldown: u64,
+
+    /// Outbound Matrix message policy
+    #[serde(default)]
+    pub blocked_matrix_msgtypes: Vec<String>,
+    #[serde(default)]
+    pub max_text_length: usize,
+
+    /// Degrade behavior when outbound delivery fails
+    #[serde(default = "default_true")]
+    pub enable_failure_degrade: bool,
+    #[serde(default = "default_failure_notice_template")]
+    pub failure_notice_template: String,
 
     /// Webhook timeout in seconds
     #[serde(default = "default_webhook_timeout")]
@@ -116,4 +129,9 @@ fn default_api_timeout() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_failure_notice_template() -> String {
+    "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
+        .to_string()
 }

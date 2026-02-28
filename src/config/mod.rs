@@ -153,6 +153,12 @@ impl Config {
             );
         }
 
+        if self.bridge.message_limit > 0 && self.bridge.message_cooldown == 0 {
+            anyhow::bail!(
+                "bridge.message_cooldown must be > 0 when bridge.message_limit is configured"
+            );
+        }
+
         let has_signature = !self.bridge.listen_secret.trim().is_empty();
         let has_token = self
             .bridge

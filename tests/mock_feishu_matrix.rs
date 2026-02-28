@@ -317,6 +317,12 @@ fn build_test_config(matrix_base: &str, db_uri: &str) -> Config {
             max_media_size: 10 * 1024 * 1024,
             message_limit: 60,
             message_cooldown: 1000,
+            blocked_matrix_msgtypes: Vec::new(),
+            max_text_length: 0,
+            enable_failure_degrade: true,
+            failure_notice_template:
+                "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
+                    .to_string(),
             webhook_timeout: 30,
             api_timeout: 60,
             enable_rich_text: true,

@@ -10,6 +10,8 @@ pub struct BridgeMetrics {
     inbound_events_total: AtomicU64,
     outbound_calls_total: AtomicU64,
     outbound_failures_total: AtomicU64,
+    policy_blocked_total: AtomicU64,
+    degraded_events_total: AtomicU64,
     cache_hits_total: AtomicU64,
     cache_misses_total: AtomicU64,
     queue_depth: AtomicU64,
@@ -17,6 +19,8 @@ pub struct BridgeMetrics {
     inbound_by_event: Mutex<HashMap<String, u64>>,
     outbound_by_api: Mutex<HashMap<String, u64>>,
     outbound_failures_by_api_code: Mutex<HashMap<String, u64>>,
+    policy_blocked_by_reason: Mutex<HashMap<String, u64>>,
+    degraded_events_by_reason: Mutex<HashMap<String, u64>>,
     cache_hits_by_name: Mutex<HashMap<String, u64>>,
     cache_misses_by_name: Mutex<HashMap<String, u64>>,
     processing_stats: Mutex<HashMap<String, ProcessingStats>>,
@@ -49,6 +53,16 @@ impl BridgeMetrics {
         self.outbound_failures_total.fetch_add(1, Ordering::Relaxed);
         let key = format!("{}|{}", api, code);
         increment_map(&self.outbound_failures_by_api_code, key);
+    }
+
+    pub fn record_policy_block(&self, reason: &str) {
+        self.policy_blocked_total.fetch_add(1, Ordering::Relaxed);
+        increment_map(&self.policy_blocked_by_reason, reason.to_string());
+    }
+
+    pub fn record_degraded_event(&self, reason: &str) {
+        self.degraded_events_total.fetch_add(1, Ordering::Relaxed);
+        increment_map(&self.degraded_events_by_reason, reason.to_string());
     }
 
     pub fn record_cache_hit(&self, cache_name: &str) {
@@ -146,6 +160,36 @@ impl BridgeMetrics {
                 "bridge_outbound_failures_total_by_api_code{{api=\"{}\",code=\"{}\"}} {}\n",
                 escape_label(api),
                 escape_label(code),
+                count
+            ));
+        }
+
+        body.push_str("# HELP bridge_policy_blocked_total Total blocked events by policy\n");
+        body.push_str("# TYPE bridge_policy_blocked_total counter\n");
+        body.push_str(&format!(
+            "bridge_policy_blocked_total {}\n",
+            self.policy_blocked_total.load(Ordering::Relaxed)
+        ));
+        for (reason, count) in sorted_pairs(&self.policy_blocked_by_reason) {
+            body.push_str(&format!(
+                "bridge_policy_blocked_total_by_reason{{reason=\"{}\"}} {}\n",
+                escape_label(&reason),
+                count
+            ));
+        }
+
+        body.push_str(
+            "# HELP bridge_degraded_events_total Total events handled via degrade path\n",
+        );
+        body.push_str("# TYPE bridge_degraded_events_total counter\n");
+        body.push_str(&format!(
+            "bridge_degraded_events_total {}\n",
+            self.degraded_events_total.load(Ordering::Relaxed)
+        ));
+        for (reason, count) in sorted_pairs(&self.degraded_events_by_reason) {
+            body.push_str(&format!(
+                "bridge_degraded_events_total_by_reason{{reason=\"{}\"}} {}\n",
+                escape_label(&reason),
                 count
             ));
         }

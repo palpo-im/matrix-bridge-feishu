@@ -1,4 +1,6 @@
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracing::{debug, info, warn};
@@ -36,6 +38,8 @@ pub struct MatrixEventProcessor {
     message_flow: Arc<MessageFlow>,
     command_handler: MatrixCommandHandler,
     dispatcher: MatrixToFeishuDispatcher,
+    rate_limiter: RoomRateLimiter,
+    blocked_msgtypes: HashSet<String>,
 }
 
 impl MatrixEventProcessor {
@@ -55,6 +59,15 @@ impl MatrixEventProcessor {
             message_store.clone(),
             media_store,
         );
+        let rate_limiter =
+            RoomRateLimiter::new(config.bridge.message_limit, config.bridge.message_cooldown);
+        let blocked_msgtypes = config
+            .bridge
+            .blocked_matrix_msgtypes
+            .iter()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .collect();
 
         Self {
             config,
@@ -65,6 +78,8 @@ impl MatrixEventProcessor {
             message_flow,
             command_handler: MatrixCommandHandler::new(self_service),
             dispatcher,
+            rate_limiter,
+            blocked_msgtypes,
         }
     }
 
@@ -123,14 +138,45 @@ impl MatrixEventProcessor {
             debug!("Message event has no content");
             return Ok(());
         };
+        let content_for_policy = content
+            .get("m.new_content")
+            .filter(|value| value.is_object())
+            .unwrap_or(content);
+        let matrix_msgtype = content_for_policy
+            .get("msgtype")
+            .and_then(Value::as_str)
+            .unwrap_or("m.text");
 
-        let body = content
+        let body = content_for_policy
             .get("body")
             .and_then(Value::as_str)
             .unwrap_or_default();
 
         if self.command_handler.is_command(body) {
             return self.handle_command(event, body).await;
+        }
+
+        if self
+            .blocked_msgtypes
+            .contains(&matrix_msgtype.to_ascii_lowercase())
+        {
+            global_metrics().record_policy_block("msgtype_blocked");
+            warn!(
+                matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+                chat_id = %event.room_id,
+                msgtype = %matrix_msgtype,
+                "Blocking Matrix event due to blocked msgtype policy"
+            );
+            return Ok(());
+        }
+        if !self.rate_limiter.allow(&event.room_id) {
+            global_metrics().record_policy_block("rate_limited");
+            warn!(
+                matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+                chat_id = %event.room_id,
+                "Dropping Matrix event due to per-room rate limit"
+            );
+            return Ok(());
         }
 
         let room_mapping = self
@@ -148,7 +194,21 @@ impl MatrixEventProcessor {
             return Ok(());
         };
 
-        let outbound = self.message_flow.matrix_to_feishu(&inbound);
+        let mut outbound = self.message_flow.matrix_to_feishu(&inbound);
+        if self.config.bridge.max_text_length > 0 {
+            let (truncated, changed) =
+                truncate_text(&outbound.content, self.config.bridge.max_text_length);
+            if changed {
+                global_metrics().record_degraded_event("text_truncated");
+                warn!(
+                    matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+                    chat_id = %event.room_id,
+                    max_text_length = self.config.bridge.max_text_length,
+                    "Truncated outbound Matrix message due to max_text_length policy"
+                );
+                outbound.content = truncated;
+            }
+        }
         let content_hash = outbound_content_hash(event, &outbound);
 
         if let Some(existing) = self
@@ -176,28 +236,53 @@ impl MatrixEventProcessor {
             event.event_id.as_deref(),
             &content_hash,
         ));
-        let mut primary_feishu_message = self
-            .dispatcher
-            .send_outbound_message(&mapping, &outbound, delivery_uuid)
-            .await?;
+        let send_result = async {
+            let mut primary_feishu_message = self
+                .dispatcher
+                .send_outbound_message(&mapping, &outbound, delivery_uuid)
+                .await?;
 
-        let attachment_message_ids = self
-            .dispatcher
-            .forward_attachments_to_feishu(&mapping, &outbound.attachments)
-            .await?;
+            let attachment_message_ids = self
+                .dispatcher
+                .forward_attachments_to_feishu(&mapping, &outbound.attachments)
+                .await?;
 
-        if primary_feishu_message.is_none() {
-            primary_feishu_message =
-                attachment_message_ids
-                    .first()
-                    .cloned()
-                    .map(|message_id| FeishuMessageSendData {
-                        message_id,
-                        root_id: None,
-                        parent_id: None,
-                        thread_id: None,
+            if primary_feishu_message.is_none() {
+                primary_feishu_message =
+                    attachment_message_ids.first().cloned().map(|message_id| {
+                        FeishuMessageSendData {
+                            message_id,
+                            root_id: None,
+                            parent_id: None,
+                            thread_id: None,
+                        }
                     });
+            }
+
+            Ok::<Option<FeishuMessageSendData>, anyhow::Error>(primary_feishu_message)
         }
+        .await;
+
+        let primary_feishu_message = match send_result {
+            Ok(message) => message,
+            Err(err) => {
+                if !self.config.bridge.enable_failure_degrade {
+                    return Err(err);
+                }
+
+                global_metrics().record_degraded_event("delivery_failure");
+                warn!(
+                    matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+                    chat_id = %event.room_id,
+                    feishu_chat_id = %mapping.feishu_chat_id,
+                    error = %err,
+                    "Outbound Matrix message failed; applying degrade template"
+                );
+                self.send_failure_degrade_notice(&mapping, event, &err)
+                    .await;
+                return Ok(());
+            }
+        };
 
         if let (Some(event_id), Some(feishu_message)) = (&event.event_id, primary_feishu_message) {
             let link = MessageMapping::new(
@@ -233,6 +318,33 @@ impl MatrixEventProcessor {
         );
 
         Ok(())
+    }
+
+    async fn send_failure_degrade_notice(
+        &self,
+        mapping: &RoomMapping,
+        event: &MatrixEvent,
+        err: &anyhow::Error,
+    ) {
+        let template = self.config.bridge.failure_notice_template.trim();
+        if template.is_empty() {
+            return;
+        }
+
+        let message = render_failure_notice(template, event, err);
+        if let Err(notice_err) = self
+            .feishu_service
+            .send_text_message(&mapping.feishu_chat_id, &message)
+            .await
+        {
+            warn!(
+                matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+                chat_id = %event.room_id,
+                feishu_chat_id = %mapping.feishu_chat_id,
+                error = %notice_err,
+                "Failed to send failure degrade notice to Feishu"
+            );
+        }
     }
 
     async fn handle_command(&self, event: &MatrixEvent, body: &str) -> anyhow::Result<()> {
@@ -386,4 +498,73 @@ impl MatrixEventProcessor {
         debug!("Reaction event: {:?}", relates_to);
         Ok(())
     }
+}
+
+struct RoomRateLimiter {
+    limit: usize,
+    window: Duration,
+    events_by_room: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl RoomRateLimiter {
+    fn new(limit: u32, window_millis: u64) -> Self {
+        Self {
+            limit: limit as usize,
+            window: Duration::from_millis(window_millis),
+            events_by_room: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allow(&self, room_id: &str) -> bool {
+        if self.limit == 0 || self.window.is_zero() {
+            return true;
+        }
+
+        let now = Instant::now();
+        let mut guard = self
+            .events_by_room
+            .lock()
+            .expect("rate limiter mutex poisoned");
+        let queue = guard.entry(room_id.to_string()).or_default();
+
+        while let Some(timestamp) = queue.front() {
+            if now.duration_since(*timestamp) > self.window {
+                queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if queue.len() >= self.limit {
+            return false;
+        }
+
+        queue.push_back(now);
+        true
+    }
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> (String, bool) {
+    if max_chars == 0 {
+        return (text.to_string(), false);
+    }
+
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return (text.to_string(), false);
+    }
+
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str(" …");
+    (truncated, true)
+}
+
+fn render_failure_notice(template: &str, event: &MatrixEvent, err: &anyhow::Error) -> String {
+    template
+        .replace(
+            "{matrix_event_id}",
+            event.event_id.as_deref().unwrap_or("unknown"),
+        )
+        .replace("{matrix_room_id}", &event.room_id)
+        .replace("{error}", &err.to_string())
 }

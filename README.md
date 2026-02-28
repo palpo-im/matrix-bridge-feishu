@@ -88,6 +88,7 @@ The bridge is built with a modular architecture:
 - **Encryption Settings**: Feishu encryption key and verification token
 - **Permissions**: User permissions and access control
 - **Message Settings**: Formatting and media handling options
+- **Message Policy Controls**: Per-room rate limit, blocked msgtypes, text-size policy, failure degrade template
 
 ### Environment Variables
 
@@ -298,6 +299,7 @@ RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
 - **Webhook signature failed**: verify `bridge.listen_secret` and request headers `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`, `X-Lark-Signature`.
 - **Permission denied on send**: check Feishu app scopes for message send/read and file/image APIs.
 - **Rate limit spikes**: monitor `/metrics` fields `bridge_outbound_failures_total_by_api_code` and tune retry env vars `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`.
+- **Policy drops / degraded send path**: monitor `/metrics` fields `bridge_policy_blocked_total_by_reason` and `bridge_degraded_events_total_by_reason`.
 
 ### Debug Mode
 
