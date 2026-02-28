@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
@@ -9,10 +10,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{FeishuClient, FeishuMessageData, FeishuMessageSendData, FeishuRichText, FeishuUser};
+use super::{
+    FeishuChatProfile, FeishuClient, FeishuMessageData, FeishuMessageSendData, FeishuRichText,
+    FeishuUser,
+};
 use crate::bridge::FeishuBridge;
 use crate::bridge::message::{Attachment, BridgeMessage, MessageType};
-use crate::util::parse_feishu_api_error;
+use crate::util::{TtlCache, parse_feishu_api_error};
 use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Clone)]
@@ -21,7 +25,13 @@ pub struct FeishuService {
     listen_address: String,
     listen_secret: String,
     chat_queues: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    user_cache: Arc<Mutex<TtlCache<String, FeishuUser>>>,
+    chat_cache: Arc<Mutex<TtlCache<String, FeishuChatProfile>>>,
 }
+
+const DEFAULT_USER_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_CHAT_CACHE_TTL_SECS: u64 = 300;
+const DEFAULT_METADATA_CACHE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 struct RecalledMessage {
@@ -52,6 +62,19 @@ impl FeishuService {
         encrypt_key: Option<String>,
         verification_token: Option<String>,
     ) -> Self {
+        let user_ttl = Duration::from_secs(read_env_u64(
+            "FEISHU_USER_CACHE_TTL_SECS",
+            DEFAULT_USER_CACHE_TTL_SECS,
+        ));
+        let chat_ttl = Duration::from_secs(read_env_u64(
+            "FEISHU_CHAT_CACHE_TTL_SECS",
+            DEFAULT_CHAT_CACHE_TTL_SECS,
+        ));
+        let cache_capacity = read_env_usize(
+            "FEISHU_METADATA_CACHE_CAPACITY",
+            DEFAULT_METADATA_CACHE_CAPACITY,
+        );
+
         Self {
             client: Arc::new(Mutex::new(FeishuClient::new(
                 app_id,
@@ -62,6 +85,8 @@ impl FeishuService {
             listen_address,
             listen_secret,
             chat_queues: Arc::new(Mutex::new(HashMap::new())),
+            user_cache: Arc::new(Mutex::new(TtlCache::new(user_ttl, cache_capacity))),
+            chat_cache: Arc::new(Mutex::new(TtlCache::new(chat_ttl, cache_capacity))),
         }
     }
 
@@ -366,6 +391,9 @@ impl FeishuService {
                     .context("failed to parse member added event")?;
                 let chat_id = event.chat_id.clone();
                 let user_ids = event.user_ids.clone();
+                for user_id in &user_ids {
+                    self.invalidate_user_cache(user_id).await;
+                }
                 let event_type_for_task = event_type.clone();
                 let event_id_for_task = header_event_id.clone();
                 let dead_letter_payload = json!({
@@ -432,6 +460,9 @@ impl FeishuService {
                     .context("failed to parse member deleted event")?;
                 let chat_id = event.chat_id.clone();
                 let user_ids = event.user_ids.clone();
+                for user_id in &user_ids {
+                    self.invalidate_user_cache(user_id).await;
+                }
                 let event_type_for_task = event_type.clone();
                 let event_id_for_task = header_event_id.clone();
                 let dead_letter_payload = json!({
@@ -497,6 +528,7 @@ impl FeishuService {
                     .webhook_event_to_chat_updated(&payload)
                     .context("failed to parse chat updated event")?;
                 let chat_id = event.chat_id.clone();
+                self.invalidate_chat_cache(&chat_id).await;
                 let chat_name = event.chat_name.clone();
                 let chat_mode = event.chat_mode.clone();
                 let chat_type = event.chat_type.clone();
@@ -566,6 +598,7 @@ impl FeishuService {
                 let chat_id = self
                     .webhook_event_to_chat_disbanded(&payload)
                     .context("failed to parse chat disbanded event")?;
+                self.invalidate_chat_cache(&chat_id).await;
                 let event_type_for_task = event_type.clone();
                 let event_id_for_task = header_event_id.clone();
                 let dead_letter_payload = json!({
@@ -966,15 +999,73 @@ impl FeishuService {
     }
 
     pub async fn get_user(&self, user_id: &str) -> Result<FeishuUser> {
+        let cache_name = "feishu_user_meta";
+        {
+            let mut cache = self.user_cache.lock().await;
+            if let Some(cached_user) = cache.get(&user_id.to_string()) {
+                global_metrics().record_cache_hit(cache_name);
+                return Ok(cached_user);
+            }
+        }
+
+        global_metrics().record_cache_miss(cache_name);
         let api = "contact.v3.users.get";
         global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
         let result = client.get_user(user_id).await;
+        if let Ok(user) = &result {
+            self.user_cache
+                .lock()
+                .await
+                .insert(user_id.to_string(), user.clone());
+        }
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
             log_feishu_api_failure(api, err);
         }
         result
+    }
+
+    pub async fn get_chat(&self, chat_id: &str) -> Result<FeishuChatProfile> {
+        let cache_name = "feishu_chat_meta";
+        {
+            let mut cache = self.chat_cache.lock().await;
+            if let Some(cached_chat) = cache.get(&chat_id.to_string()) {
+                global_metrics().record_cache_hit(cache_name);
+                return Ok(cached_chat);
+            }
+        }
+
+        global_metrics().record_cache_miss(cache_name);
+        let api = "im.v1.chats.get";
+        global_metrics().record_outbound_call(api);
+        let mut client = self.client.lock().await;
+        let result = client.get_chat(chat_id).await;
+        if let Ok(chat) = &result {
+            self.chat_cache
+                .lock()
+                .await
+                .insert(chat_id.to_string(), chat.clone());
+        }
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
+        }
+        result
+    }
+
+    pub async fn invalidate_user_cache(&self, user_id: &str) {
+        self.user_cache
+            .lock()
+            .await
+            .invalidate(&user_id.to_string());
+    }
+
+    pub async fn invalidate_chat_cache(&self, chat_id: &str) {
+        self.chat_cache
+            .lock()
+            .await
+            .invalidate(&chat_id.to_string());
     }
 
     pub async fn send_message(
@@ -1337,6 +1428,20 @@ fn collect_user_ids(source: Option<&Value>, output: &mut Vec<String>) {
     if let Some(id) = pick_first_string(value, &["/user_id", "/open_id"]) {
         output.push(id);
     }
+}
+
+fn read_env_u64(key: &str, default_value: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default_value)
+}
+
+fn read_env_usize(key: &str, default_value: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default_value)
 }
 
 struct FeishuWebhookHandler {

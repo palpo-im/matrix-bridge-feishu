@@ -151,6 +151,15 @@ pub struct FeishuUserStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuChatProfile {
+    pub chat_id: String,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub chat_mode: Option<String>,
+    pub chat_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeishuChat {
     pub chat_id: String,
     pub name: Option<String>,

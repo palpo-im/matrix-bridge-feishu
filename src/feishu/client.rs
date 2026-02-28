@@ -145,6 +145,28 @@ impl FeishuClient {
         Ok(data.user)
     }
 
+    pub async fn get_chat(&mut self, chat_id: &str) -> Result<FeishuChatProfile> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/chats/{}", Self::api_base(), chat_id);
+
+        let response = self
+            .execute_json(
+                self.client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", access_token)),
+            )
+            .await
+            .context("failed to call im/v1/chats/get")?;
+
+        #[derive(serde::Deserialize)]
+        struct ChatWrapper {
+            chat: FeishuChatProfile,
+        }
+
+        let data: ChatWrapper = Self::parse_data("im/v1/chats/get", response)?;
+        Ok(data.chat)
+    }
+
     pub async fn send_message(
         &mut self,
         receive_id_type: &str,

@@ -10,11 +10,15 @@ pub struct BridgeMetrics {
     inbound_events_total: AtomicU64,
     outbound_calls_total: AtomicU64,
     outbound_failures_total: AtomicU64,
+    cache_hits_total: AtomicU64,
+    cache_misses_total: AtomicU64,
     queue_depth: AtomicU64,
     queue_depth_max: AtomicU64,
     inbound_by_event: Mutex<HashMap<String, u64>>,
     outbound_by_api: Mutex<HashMap<String, u64>>,
     outbound_failures_by_api_code: Mutex<HashMap<String, u64>>,
+    cache_hits_by_name: Mutex<HashMap<String, u64>>,
+    cache_misses_by_name: Mutex<HashMap<String, u64>>,
     processing_stats: Mutex<HashMap<String, ProcessingStats>>,
 }
 
@@ -45,6 +49,16 @@ impl BridgeMetrics {
         self.outbound_failures_total.fetch_add(1, Ordering::Relaxed);
         let key = format!("{}|{}", api, code);
         increment_map(&self.outbound_failures_by_api_code, key);
+    }
+
+    pub fn record_cache_hit(&self, cache_name: &str) {
+        self.cache_hits_total.fetch_add(1, Ordering::Relaxed);
+        increment_map(&self.cache_hits_by_name, cache_name.to_string());
+    }
+
+    pub fn record_cache_miss(&self, cache_name: &str) {
+        self.cache_misses_total.fetch_add(1, Ordering::Relaxed);
+        increment_map(&self.cache_misses_by_name, cache_name.to_string());
     }
 
     pub fn record_processing_duration(&self, stage: &str, duration: Duration) {
@@ -133,6 +147,69 @@ impl BridgeMetrics {
                 escape_label(api),
                 escape_label(code),
                 count
+            ));
+        }
+
+        body.push_str("# HELP bridge_cache_hits_total Total cache hits\n");
+        body.push_str("# TYPE bridge_cache_hits_total counter\n");
+        body.push_str(&format!(
+            "bridge_cache_hits_total {}\n",
+            self.cache_hits_total.load(Ordering::Relaxed)
+        ));
+        body.push_str("# HELP bridge_cache_misses_total Total cache misses\n");
+        body.push_str("# TYPE bridge_cache_misses_total counter\n");
+        body.push_str(&format!(
+            "bridge_cache_misses_total {}\n",
+            self.cache_misses_total.load(Ordering::Relaxed)
+        ));
+
+        let hits_by_cache = sorted_pairs(&self.cache_hits_by_name);
+        let misses_by_cache = sorted_pairs(&self.cache_misses_by_name);
+        let mut all_cache_names: Vec<String> = hits_by_cache
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(misses_by_cache.iter().map(|(name, _)| name.clone()))
+            .collect();
+        all_cache_names.sort();
+        all_cache_names.dedup();
+
+        body.push_str("# HELP bridge_cache_requests_total Cache requests by result\n");
+        body.push_str("# TYPE bridge_cache_requests_total counter\n");
+        body.push_str("# HELP bridge_cache_hit_ratio Cache hit ratio by cache name\n");
+        body.push_str("# TYPE bridge_cache_hit_ratio gauge\n");
+
+        for cache_name in all_cache_names {
+            let hits = hits_by_cache
+                .iter()
+                .find(|(name, _)| name == &cache_name)
+                .map(|(_, value)| *value)
+                .unwrap_or(0);
+            let misses = misses_by_cache
+                .iter()
+                .find(|(name, _)| name == &cache_name)
+                .map(|(_, value)| *value)
+                .unwrap_or(0);
+            let total = hits + misses;
+            let ratio = if total == 0 {
+                0.0
+            } else {
+                hits as f64 / total as f64
+            };
+
+            body.push_str(&format!(
+                "bridge_cache_requests_total{{cache=\"{}\",result=\"hit\"}} {}\n",
+                escape_label(&cache_name),
+                hits
+            ));
+            body.push_str(&format!(
+                "bridge_cache_requests_total{{cache=\"{}\",result=\"miss\"}} {}\n",
+                escape_label(&cache_name),
+                misses
+            ));
+            body.push_str(&format!(
+                "bridge_cache_hit_ratio{{cache=\"{}\"}} {:.6}\n",
+                escape_label(&cache_name),
+                ratio
             ));
         }
 

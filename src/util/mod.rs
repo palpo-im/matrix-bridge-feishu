@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::hash::Hash;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 
@@ -13,6 +15,19 @@ pub struct FeishuApiErrorFields {
     pub code: String,
     pub msg: String,
     pub retryable: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TtlEntry<V> {
+    value: V,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct TtlCache<K, V> {
+    entries: HashMap<K, TtlEntry<V>>,
+    ttl: Duration,
+    max_entries: usize,
 }
 
 impl UidGenerator {
@@ -67,6 +82,64 @@ impl UidGenerator {
 impl Default for UidGenerator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<K, V> TtlCache<K, V>
+where
+    K: Eq + Hash + Clone,
+    V: Clone,
+{
+    pub fn new(ttl: Duration, max_entries: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl,
+            max_entries: max_entries.max(1),
+        }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        if let Some(entry) = self.entries.get(key) {
+            if Instant::now() < entry.expires_at {
+                return Some(entry.value.clone());
+            }
+        }
+
+        self.entries.remove(key);
+        None
+    }
+
+    pub fn insert(&mut self, key: K, value: V) {
+        if self.entries.len() >= self.max_entries {
+            self.remove_oldest_entry();
+        }
+
+        self.entries.insert(
+            key,
+            TtlEntry {
+                value,
+                expires_at: Instant::now() + self.ttl,
+            },
+        );
+    }
+
+    pub fn invalidate(&mut self, key: &K) {
+        self.entries.remove(key);
+    }
+
+    fn remove_oldest_entry(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+
+        if let Some(key) = self
+            .entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.expires_at)
+            .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&key);
+        }
     }
 }
 

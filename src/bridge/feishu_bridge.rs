@@ -525,12 +525,37 @@ impl FeishuBridge {
             .get_room_by_feishu_id(&message.room_id)
             .await?;
 
-        let portal = if let Some(mapping) = room_mapping {
+        let chat_profile = if room_mapping
+            .as_ref()
+            .and_then(|mapping| mapping.feishu_chat_name.as_deref())
+            .is_none()
+        {
+            self.feishu_service.get_chat(&message.room_id).await.ok()
+        } else {
+            None
+        };
+
+        let portal = if let Some(mut mapping) = room_mapping {
+            if mapping.feishu_chat_name.is_none() {
+                if let Some(name) = chat_profile.as_ref().and_then(|chat| chat.name.clone()) {
+                    mapping.feishu_chat_name = Some(name.clone());
+                    mapping.updated_at = Utc::now();
+                    if let Err(err) = self.stores.room_store().update_room_mapping(&mapping).await {
+                        warn!(
+                            chat_id = %message.room_id,
+                            error = %err,
+                            "Failed to backfill Feishu chat name into room mapping"
+                        );
+                    }
+                }
+            }
+
             BridgePortal::new(
                 message.room_id.clone(),
                 mapping.matrix_room_id.clone(),
                 mapping
                     .feishu_chat_name
+                    .or_else(|| chat_profile.as_ref().and_then(|chat| chat.name.clone()))
                     .unwrap_or_else(|| message.room_id.clone()),
                 format!(
                     "@{}:{}",
@@ -706,7 +731,8 @@ impl FeishuBridge {
         };
 
         if !user_ids.is_empty() {
-            let notice = format!("Feishu members joined: {}", user_ids.join(", "));
+            let labels = self.resolve_feishu_user_labels(user_ids).await;
+            let notice = format!("Feishu members joined: {}", labels.join(", "));
             if let Err(err) = self
                 .bot_intent
                 .send_notice(&mapping.matrix_room_id, &notice)
@@ -747,7 +773,8 @@ impl FeishuBridge {
         };
 
         if !user_ids.is_empty() {
-            let notice = format!("Feishu members left: {}", user_ids.join(", "));
+            let labels = self.resolve_feishu_user_labels(user_ids).await;
+            let notice = format!("Feishu members left: {}", labels.join(", "));
             if let Err(err) = self
                 .bot_intent
                 .send_notice(&mapping.matrix_room_id, &notice)
@@ -761,6 +788,23 @@ impl FeishuBridge {
         }
 
         Ok(())
+    }
+
+    async fn resolve_feishu_user_labels(&self, user_ids: &[String]) -> Vec<String> {
+        let mut labels = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            match self.feishu_service.get_user(user_id).await {
+                Ok(user) => {
+                    if user.name.trim().is_empty() {
+                        labels.push(user_id.clone());
+                    } else {
+                        labels.push(format!("{}({})", user.name, user_id));
+                    }
+                }
+                Err(_) => labels.push(user_id.clone()),
+            }
+        }
+        labels
     }
 
     pub async fn handle_feishu_chat_updated(
