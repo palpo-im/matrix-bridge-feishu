@@ -202,3 +202,94 @@ pub fn convert_feishu_emoticons(content: &str) -> String {
         .replace("[爱心]", "❤️")
         .replace("[强]", "💪")
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+
+    use super::{
+        convert_feishu_emoticons, extract_links_from_rich_text, extract_mentions_from_rich_text,
+        format_feishu_to_matrix,
+    };
+    use crate::bridge::message::MessageType;
+    use crate::feishu::types::{
+        FeishuMention, FeishuMessage, FeishuMessageContent, FeishuRichText, FeishuRichTextContent,
+        FeishuRichTextElement,
+    };
+
+    #[test]
+    fn extract_mentions_and_links_from_rich_text() {
+        let rich = FeishuRichText {
+            title: None,
+            content: vec![
+                FeishuRichTextElement {
+                    segment_type: "mention".to_string(),
+                    content: FeishuRichTextContent {
+                        text: None,
+                        link: None,
+                        mention: Some(FeishuMention {
+                            user_id: Some("ou_123".to_string()),
+                            chat_id: None,
+                            name: "alice".to_string(),
+                        }),
+                        image: None,
+                    },
+                },
+                FeishuRichTextElement {
+                    segment_type: "link".to_string(),
+                    content: FeishuRichTextContent {
+                        text: None,
+                        link: Some("https://example.com".to_string()),
+                        mention: None,
+                        image: None,
+                    },
+                },
+            ],
+        };
+
+        let mentions = extract_mentions_from_rich_text(&rich);
+        let links = extract_links_from_rich_text(&rich);
+        assert_eq!(mentions, vec!["ou_123".to_string()]);
+        assert_eq!(links, vec!["https://example.com".to_string()]);
+    }
+
+    #[test]
+    fn convert_feishu_emoticons_to_unicode() {
+        assert_eq!(convert_feishu_emoticons("[微笑] [赞]"), "😊 👍");
+    }
+
+    #[test]
+    fn format_feishu_to_matrix_falls_back_for_unsupported_type() {
+        let message = FeishuMessage {
+            message_id: "om_xxx".to_string(),
+            chat_id: "oc_xxx".to_string(),
+            chat_type: "group".to_string(),
+            sender_id: "ou_xxx".to_string(),
+            sender_type: "user".to_string(),
+            create_time: Utc::now(),
+            update_time: None,
+            delete_time: None,
+            msg_type: "unknown".to_string(),
+            parent_id: None,
+            thread_id: None,
+            root_id: None,
+            mentioned_sender: None,
+            mentioned_users: Vec::new(),
+            mentioned_chats: Vec::new(),
+            content: FeishuMessageContent {
+                text: None,
+                rich_text: None,
+                image_key: None,
+                file_key: None,
+                audio_key: None,
+                video_key: None,
+                sticker_id: None,
+                card: None,
+            },
+        };
+
+        let bridged = format_feishu_to_matrix(message);
+        assert!(matches!(bridged.msg_type, MessageType::Text));
+        assert!(bridged.content.contains("[Unsupported: unknown]"));
+    }
+}

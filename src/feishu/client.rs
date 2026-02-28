@@ -818,4 +818,22 @@ mod tests {
             "invalid_request"
         );
     }
+
+    #[test]
+    fn classify_http_error_handles_auth_and_timeout() {
+        assert_eq!(classify_http_error(401).as_str(), "auth_failed");
+        assert_eq!(classify_http_error(408).as_str(), "invalid_request");
+    }
+
+    #[test]
+    fn classify_api_error_detects_auth_and_permission_signals() {
+        assert_eq!(
+            classify_api_error(99991664, "tenant_access_token invalid").as_str(),
+            "auth_failed"
+        );
+        assert_eq!(
+            classify_api_error(42, "forbidden by scope").as_str(),
+            "permission_denied"
+        );
+    }
 }

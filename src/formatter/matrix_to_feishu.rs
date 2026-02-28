@@ -212,3 +212,58 @@ pub fn create_feishu_card_message(title: &str, content: &str) -> Value {
         }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::{
+        convert_matrix_emoticons, convert_matrix_html_to_feishu, convert_matrix_text_to_feishu,
+        create_feishu_rich_text, extract_matrix_mentions,
+    };
+
+    #[test]
+    fn convert_matrix_text_to_feishu_strips_html_and_mentions() {
+        let input = "<b>@alice:example.com</b> says <i>hello</i>";
+        let converted = convert_matrix_text_to_feishu(input);
+        assert!(converted.contains("@alice"));
+        assert!(!converted.contains("<b>"));
+        assert!(!converted.contains(":example.com"));
+    }
+
+    #[test]
+    fn create_feishu_rich_text_extracts_mentions_and_links() {
+        let rich = create_feishu_rich_text("@alice check https://example.com");
+        let parsed: Value = serde_json::from_str(&rich).expect("valid rich text json");
+        let content = parsed
+            .pointer("/zh_cn/content/0")
+            .and_then(Value::as_array)
+            .expect("content row should exist");
+        let tags: Vec<String> = content
+            .iter()
+            .filter_map(|item| item.get("tag").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect();
+        assert!(tags.contains(&"at".to_string()));
+        assert!(tags.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn convert_matrix_html_to_feishu_keeps_link_text_and_url() {
+        let html = r#"<p>Hello <a href="https://example.com">example</a></p>"#;
+        let converted = convert_matrix_html_to_feishu(html);
+        assert!(converted.contains("example (https//example.com)"));
+    }
+
+    #[test]
+    fn extract_matrix_mentions_normalizes_matrix_user_ids() {
+        let mentions = extract_matrix_mentions("ping @bob:example.com and @carol:example.net");
+        assert_eq!(mentions, "ping @bob and @carol");
+    }
+
+    #[test]
+    fn convert_matrix_emoticons_maps_common_unicode() {
+        let converted = convert_matrix_emoticons("Great 😊 👍");
+        assert_eq!(converted, "Great [微笑] [赞]");
+    }
+}
