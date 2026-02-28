@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{Duration as ChronoDuration, TimeZone, Utc};
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sqlite::SqliteConnection;
 use matrix_bot_sdk::appservice::{Appservice, AppserviceHandler, Intent};
@@ -19,7 +19,7 @@ use super::MatrixEvent;
 use super::message::{BridgeMessage, MessageType};
 use super::portal::{BridgePortal, RoomType};
 use super::puppet::BridgePuppet;
-use super::user::BridgeUser;
+use super::user::{BridgeUser, UserSyncPolicy};
 use crate::bridge::{
     MatrixCommandHandler, MatrixCommandOutcome, MatrixEventProcessor, MessageFlow, PresenceHandler,
     ProvisioningCoordinator,
@@ -28,7 +28,7 @@ use crate::config::Config;
 use crate::database::sqlite_stores::SqliteStores;
 use crate::database::{
     Database, DeadLetterEvent, DeadLetterStore, EventStore, MediaStore, MessageMapping,
-    MessageStore, ProcessedEvent, RoomStore,
+    MessageStore, ProcessedEvent, RoomStore, UserMapping, UserStore,
 };
 use crate::feishu::FeishuService;
 use crate::formatter;
@@ -53,6 +53,8 @@ pub struct FeishuBridge {
     provisioning: Arc<ProvisioningCoordinator>,
     _presence_handler: Arc<PresenceHandler>,
     started_at: Instant,
+    user_sync_policy: UserSyncPolicy,
+    user_last_synced_at: Arc<RwLock<HashMap<String, Instant>>>,
 }
 
 impl FeishuBridge {
@@ -110,6 +112,10 @@ impl FeishuBridge {
         let command_handler = Arc::new(MatrixCommandHandler::new(true));
         let provisioning = Arc::new(ProvisioningCoordinator::new(config.bridge.webhook_timeout));
         let presence_handler = Arc::new(PresenceHandler::new(Some(50)));
+        let user_sync_policy = UserSyncPolicy::new(
+            Duration::from_secs(config.bridge.user_sync_interval_secs),
+            ChronoDuration::hours(config.bridge.user_mapping_stale_ttl_hours as i64),
+        );
 
         Ok(Self {
             config,
@@ -127,6 +133,8 @@ impl FeishuBridge {
             provisioning,
             _presence_handler: presence_handler,
             started_at: Instant::now(),
+            user_sync_policy,
+            user_last_synced_at: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -165,6 +173,11 @@ impl FeishuBridge {
             if let Err(e) = service.start(bridge_clone).await {
                 error!("Feishu service error: {}", e);
             }
+        });
+
+        let maintenance_bridge = self.clone();
+        tokio::spawn(async move {
+            maintenance_bridge.run_user_sync_maintenance_loop().await;
         });
 
         let room_store = self.stores.room_store();
@@ -283,6 +296,10 @@ impl FeishuBridge {
 
     pub fn room_store(&self) -> Arc<dyn RoomStore> {
         self.stores.room_store()
+    }
+
+    pub fn user_store(&self) -> Arc<dyn UserStore> {
+        self.stores.user_store()
     }
 
     pub fn event_store(&self) -> Arc<dyn EventStore> {
@@ -504,6 +521,120 @@ impl FeishuBridge {
         }
     }
 
+    async fn reserve_user_sync_slot(&self, feishu_user_id: &str) -> bool {
+        let mut guard = self.user_last_synced_at.write().await;
+        let last_synced_at = guard.get(feishu_user_id).copied();
+        if !self.user_sync_policy.should_refresh(last_synced_at) {
+            return false;
+        }
+        guard.insert(feishu_user_id.to_string(), Instant::now());
+        true
+    }
+
+    async fn sync_feishu_user_mapping(&self, feishu_user_id: &str) -> anyhow::Result<()> {
+        if feishu_user_id.trim().is_empty() {
+            return Ok(());
+        }
+        if !self.reserve_user_sync_slot(feishu_user_id).await {
+            return Ok(());
+        }
+
+        let profile = self.feishu_service.get_user(feishu_user_id).await?;
+        let matrix_localpart = self.config.format_username(&profile.user_id);
+        let matrix_user_id = format!("@{}:{}", matrix_localpart, self.config.homeserver.domain);
+        let displayname = profile.name.trim().to_string();
+        let avatar_url = profile
+            .avatar
+            .as_ref()
+            .map(|avatar| avatar.avatar_240.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let user_store = self.user_store();
+        if let Some(mut mapping) = user_store.get_user_by_feishu_id(&profile.user_id).await? {
+            let mut changed = false;
+            if mapping.matrix_user_id != matrix_user_id {
+                mapping.matrix_user_id = matrix_user_id.clone();
+                changed = true;
+            }
+            if mapping.feishu_username.as_deref() != Some(displayname.as_str()) {
+                mapping.feishu_username = Some(displayname.clone());
+                changed = true;
+            }
+            if mapping.feishu_avatar != avatar_url {
+                mapping.feishu_avatar = avatar_url.clone();
+                changed = true;
+            }
+            if changed {
+                mapping.updated_at = Utc::now();
+                user_store.update_user_mapping(&mapping).await?;
+            }
+        } else {
+            let mut mapping = UserMapping::new(
+                matrix_user_id.clone(),
+                profile.user_id.clone(),
+                Some(displayname.clone()),
+            );
+            mapping.feishu_avatar = avatar_url.clone();
+            user_store.create_user_mapping(&mapping).await?;
+        }
+
+        {
+            let mut users = self._users_by_mxid.write().await;
+            let entry = users
+                .entry(matrix_user_id.clone())
+                .or_insert_with(|| BridgeUser::new(matrix_user_id.clone()));
+            entry.feishu_user_id = Some(profile.user_id.clone());
+            entry.connection_state = super::user::ConnectionState::Connected;
+        }
+        {
+            let mut puppets = self._puppets.write().await;
+            let puppet = puppets.entry(profile.user_id.clone()).or_insert_with(|| {
+                BridgePuppet::new(
+                    profile.user_id.clone(),
+                    matrix_user_id.clone(),
+                    displayname.clone(),
+                )
+            });
+            puppet.apply_profile_sync(Some(&displayname), avatar_url.as_deref());
+        }
+
+        Ok(())
+    }
+
+    async fn run_user_sync_maintenance_loop(self) {
+        let interval_secs = self.config.bridge.user_sync_interval_secs.max(30);
+        let ticker = Duration::from_secs(interval_secs);
+        let user_store = self.user_store();
+
+        loop {
+            tokio::time::sleep(ticker).await;
+
+            let cutoff = self.user_sync_policy.stale_cutoff(Utc::now());
+            match user_store.cleanup_stale_user_mappings(cutoff).await {
+                Ok(removed) => {
+                    if removed > 0 {
+                        info!(
+                            removed = removed,
+                            stale_cutoff = %cutoff,
+                            "Cleaned stale user mappings"
+                        );
+                    }
+                }
+                Err(err) => warn!(
+                    error = %err,
+                    "Failed to clean stale user mappings"
+                ),
+            }
+
+            let retention = Duration::from_secs(interval_secs.saturating_mul(4).max(120));
+            let now = Instant::now();
+            self.user_last_synced_at
+                .write()
+                .await
+                .retain(|_, synced_at| now.duration_since(*synced_at) <= retention);
+        }
+    }
+
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
         let _timer = ScopedTimer::new("feishu_message_process");
         info!(
@@ -525,6 +656,14 @@ impl FeishuBridge {
                 "Skipping already bridged Feishu message (duplicate or echo)"
             );
             return Ok(());
+        }
+
+        if let Err(err) = self.sync_feishu_user_mapping(&message.sender).await {
+            warn!(
+                feishu_user_id = %message.sender,
+                error = %err,
+                "Failed to sync Feishu user mapping metadata"
+            );
         }
 
         let room_mapping = self
@@ -739,6 +878,16 @@ impl FeishuBridge {
         };
 
         if !user_ids.is_empty() {
+            for user_id in user_ids {
+                if let Err(err) = self.sync_feishu_user_mapping(user_id).await {
+                    warn!(
+                        feishu_user_id = %user_id,
+                        chat_id = %feishu_chat_id,
+                        error = %err,
+                        "Failed to sync Feishu user mapping on member-added event"
+                    );
+                }
+            }
             let labels = self.resolve_feishu_user_labels(user_ids).await;
             let notice = format!("Feishu members joined: {}", labels.join(", "));
             if let Err(err) = self
@@ -781,6 +930,16 @@ impl FeishuBridge {
         };
 
         if !user_ids.is_empty() {
+            for user_id in user_ids {
+                if let Err(err) = self.sync_feishu_user_mapping(user_id).await {
+                    warn!(
+                        feishu_user_id = %user_id,
+                        chat_id = %feishu_chat_id,
+                        error = %err,
+                        "Failed to sync Feishu user mapping on member-deleted event"
+                    );
+                }
+            }
             let labels = self.resolve_feishu_user_labels(user_ids).await;
             let notice = format!("Feishu members left: {}", labels.join(", "));
             if let Err(err) = self

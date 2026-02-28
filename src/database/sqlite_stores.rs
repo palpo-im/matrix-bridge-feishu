@@ -408,6 +408,35 @@ impl UserStore for SqliteStores {
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
+
+    async fn count_users(&self) -> DatabaseResult<i64> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let count: i64 = user_mappings::table
+                .count()
+                .get_result(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(count)
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn cleanup_stale_user_mappings(&self, before: DateTime<Utc>) -> DatabaseResult<u64> {
+        let pool = self.pool.clone();
+        let before = before.to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let deleted =
+                diesel::delete(user_mappings::table.filter(user_mappings::updated_at.lt(before)))
+                    .execute(&mut conn)
+                    .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(deleted as u64)
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
 }
 
 #[async_trait]

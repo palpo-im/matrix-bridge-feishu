@@ -1,5 +1,7 @@
 use anyhow::Result;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeUser {
@@ -24,6 +26,32 @@ pub enum ConnectionState {
     Connected,
     Error,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserSyncPolicy {
+    min_refresh_interval: Duration,
+    stale_ttl: ChronoDuration,
+}
+
+impl UserSyncPolicy {
+    pub fn new(min_refresh_interval: Duration, stale_ttl: ChronoDuration) -> Self {
+        Self {
+            min_refresh_interval,
+            stale_ttl,
+        }
+    }
+
+    pub fn should_refresh(&self, last_synced_at: Option<Instant>) -> bool {
+        match last_synced_at {
+            None => true,
+            Some(last_synced_at) => last_synced_at.elapsed() >= self.min_refresh_interval,
+        }
+    }
+
+    pub fn stale_cutoff(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now - self.stale_ttl
+    }
 }
 
 impl BridgeUser {
@@ -64,5 +92,11 @@ impl BridgeUser {
 
     pub fn is_connected(&self) -> bool {
         matches!(self.connection_state, ConnectionState::Connected)
+    }
+}
+
+impl Default for UserSyncPolicy {
+    fn default() -> Self {
+        Self::new(Duration::from_secs(300), ChronoDuration::hours(24 * 30))
     }
 }

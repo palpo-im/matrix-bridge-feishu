@@ -47,6 +47,8 @@ pub trait UserStore: Send + Sync {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> DatabaseResult<Vec<UserMapping>>;
+    async fn count_users(&self) -> DatabaseResult<i64>;
+    async fn cleanup_stale_user_mappings(&self, before: DateTime<Utc>) -> DatabaseResult<u64>;
 }
 
 #[async_trait]

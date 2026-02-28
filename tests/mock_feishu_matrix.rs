@@ -323,6 +323,8 @@ fn build_test_config(matrix_base: &str, db_uri: &str) -> Config {
             failure_notice_template:
                 "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
                     .to_string(),
+            user_sync_interval_secs: 300,
+            user_mapping_stale_ttl_hours: 720,
             webhook_timeout: 30,
             api_timeout: 60,
             enable_rich_text: true,

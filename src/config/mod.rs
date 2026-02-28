@@ -158,6 +158,12 @@ impl Config {
                 "bridge.message_cooldown must be > 0 when bridge.message_limit is configured"
             );
         }
+        if self.bridge.user_sync_interval_secs == 0 {
+            anyhow::bail!("bridge.user_sync_interval_secs must be > 0");
+        }
+        if self.bridge.user_mapping_stale_ttl_hours == 0 {
+            anyhow::bail!("bridge.user_mapping_stale_ttl_hours must be > 0");
+        }
 
         let has_signature = !self.bridge.listen_secret.trim().is_empty();
         let has_token = self

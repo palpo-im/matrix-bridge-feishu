@@ -123,6 +123,10 @@ bridge:
   enable_failure_degrade: true
   # Degrade template variables: {matrix_event_id}, {matrix_room_id}, {error}
   failure_notice_template: "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
+  # User profile sync interval in seconds
+  user_sync_interval_secs: 300
+  # Remove stale user mappings older than this TTL in hours
+  user_mapping_stale_ttl_hours: 720
   # Webhook timeout in seconds
   webhook_timeout: 30
   # Feishu API timeout in seconds

@@ -89,6 +89,7 @@ The bridge is built with a modular architecture:
 - **Permissions**: User permissions and access control
 - **Message Settings**: Formatting and media handling options
 - **Message Policy Controls**: Per-room rate limit, blocked msgtypes, text-size policy, failure degrade template
+- **User Identity Sync**: `user_sync_interval_secs` refresh cadence and `user_mapping_stale_ttl_hours` cleanup TTL
 
 ### Environment Variables
 

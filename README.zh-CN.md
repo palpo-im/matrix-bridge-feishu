@@ -24,6 +24,7 @@ cargo run -- -c config.yaml
 - `homeserver`: Matrix homeserver 地址、域名与兼容选项。
 - `appservice`: appservice 监听地址、端口、数据库（仅 SQLite）、token。
 - `bridge`: 飞书 webhook 地址/密钥、飞书应用凭据、权限与消息策略。
+  - 包含用户身份同步参数：`user_sync_interval_secs` 与 `user_mapping_stale_ttl_hours`。
 - `logging`: 日志级别与输出方式。
 
 详情见 `example-config.yaml`。

@@ -42,4 +42,33 @@ impl BridgePuppet {
         self.is_online = false;
         Ok(())
     }
+
+    pub fn apply_profile_sync(
+        &mut self,
+        displayname: Option<&str>,
+        avatar_url: Option<&str>,
+    ) -> bool {
+        let mut changed = false;
+
+        if let Some(displayname) = displayname {
+            let normalized = displayname.trim();
+            if !normalized.is_empty() && self.displayname != normalized {
+                self.displayname = normalized.to_string();
+                self.name_set = true;
+                changed = true;
+            }
+        }
+
+        let normalized_avatar = avatar_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if self.avatar_url != normalized_avatar {
+            self.avatar_url = normalized_avatar;
+            self.avatar_set = self.avatar_url.is_some();
+            changed = true;
+        }
+
+        changed
+    }
 }

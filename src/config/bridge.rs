@@ -90,6 +90,12 @@ pub struct BridgeConfig {
     #[serde(default = "default_failure_notice_template")]
     pub failure_notice_template: String,
 
+    /// User profile synchronization controls
+    #[serde(default = "default_user_sync_interval_secs")]
+    pub user_sync_interval_secs: u64,
+    #[serde(default = "default_user_mapping_stale_ttl_hours")]
+    pub user_mapping_stale_ttl_hours: u64,
+
     /// Webhook timeout in seconds
     #[serde(default = "default_webhook_timeout")]
     pub webhook_timeout: u64,
@@ -134,4 +140,12 @@ fn default_true() -> bool {
 fn default_failure_notice_template() -> String {
     "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
         .to_string()
+}
+
+fn default_user_sync_interval_secs() -> u64 {
+    300
+}
+
+fn default_user_mapping_stale_ttl_hours() -> u64 {
+    24 * 30
 }
