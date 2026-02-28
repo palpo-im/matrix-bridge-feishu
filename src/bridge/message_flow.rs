@@ -48,7 +48,7 @@ pub struct OutboundFeishuMessage {
     pub msg_type: String,
     pub reply_to: Option<String>,
     pub edit_of: Option<String>,
-    pub attachments: Vec<String>,
+    pub attachments: Vec<MessageAttachment>,
 }
 
 impl OutboundFeishuMessage {
@@ -64,7 +64,13 @@ impl OutboundFeishuMessage {
             parts.push(self.content.clone());
         }
         if !self.attachments.is_empty() {
-            parts.push(self.attachments.join("\n"));
+            parts.push(
+                self.attachments
+                    .iter()
+                    .map(|attachment| attachment.url.clone())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
         }
         parts.join("")
     }
@@ -168,11 +174,7 @@ impl MessageFlow {
             Some(MessageRelation::Replace { event_id }) => Some(event_id.clone()),
             _ => None,
         };
-        let attachments = message
-            .attachments
-            .iter()
-            .map(|attachment| attachment.url.clone())
-            .collect();
+        let attachments = message.attachments.clone();
 
         let content = self.format_for_feishu(&message.body);
         let msg_type = if self.config.bridge.enable_rich_text {

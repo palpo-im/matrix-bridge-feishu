@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,16 +7,26 @@ use salvo::prelude::*;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
-use super::{FeishuClient, FeishuWebhookEvent};
+use super::{
+    FeishuClient, FeishuMessageData, FeishuMessageSendData, FeishuRichText, FeishuUser,
+};
 use crate::bridge::FeishuBridge;
-use crate::bridge::message::{BridgeMessage, MessageType};
+use crate::bridge::message::{Attachment, BridgeMessage, MessageType};
 
 #[derive(Clone)]
 pub struct FeishuService {
     client: Arc<Mutex<FeishuClient>>,
     listen_address: String,
     listen_secret: String,
+    chat_queues: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+}
+
+#[derive(Debug, Clone)]
+struct RecalledMessage {
+    message_id: String,
+    chat_id: String,
 }
 
 impl FeishuService {
@@ -36,6 +47,7 @@ impl FeishuService {
             ))),
             listen_address,
             listen_secret,
+            chat_queues: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -81,6 +93,24 @@ impl FeishuService {
             .hoop(Logger::new())
             .push(Router::with_path("/webhook").post(handler))
             .push(Router::with_path("/health").get(feishu_health))
+    }
+
+    async fn queue_chat_task<F>(&self, chat_id: String, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let queue_lock = {
+            let mut queues = self.chat_queues.lock().await;
+            queues
+                .entry(chat_id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+
+        tokio::spawn(async move {
+            let _guard = queue_lock.lock().await;
+            task.await;
+        });
     }
 
     async fn handle_webhook(
@@ -138,30 +168,66 @@ impl FeishuService {
             return Ok(());
         }
 
-        let event: FeishuWebhookEvent =
-            serde_json::from_value(payload).context("failed to parse webhook event body")?;
-        info!("Received Feishu event: {}", event.header.event_type);
-
-        let supported_event = matches!(
-            event.header.event_type.as_str(),
-            "im.message.receive_v1" | "message.receive_v1"
-        );
-
-        if !supported_event {
-            debug!(
-                "Ignoring unsupported Feishu event type: {}",
-                event.header.event_type
-            );
-            res.status_code(StatusCode::OK);
-            res.render("ignored");
+        self.verify_payload_token(&payload, res).await?;
+        if res.status_code == Some(StatusCode::UNAUTHORIZED) {
             return Ok(());
         }
 
-        let bridge_message = self.webhook_event_to_bridge_message(event)?;
-        bridge.handle_feishu_message(bridge_message).await?;
+        let event_type = payload
+            .pointer("/header/event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
 
-        res.status_code(StatusCode::OK);
-        res.render("success");
+        if event_type.is_empty() {
+            warn!("Webhook payload missing header.event_type: {}", payload);
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render("missing event type");
+            return Ok(());
+        }
+
+        info!("Received Feishu event: {}", event_type);
+
+        match event_type.as_str() {
+            "im.message.receive_v1" | "message.receive_v1" => {
+                let bridge_message = self
+                    .webhook_event_to_bridge_message(&payload)
+                    .context("failed to parse receive event")?;
+                let chat_id = bridge_message.room_id.clone();
+                self.queue_chat_task(chat_id, async move {
+                    if let Err(err) = bridge.handle_feishu_message(bridge_message).await {
+                        error!("Failed to process Feishu receive event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
+            "im.message.recalled_v1" => {
+                let recalled = self
+                    .webhook_event_to_recalled_message(&payload)
+                    .context("failed to parse recalled event")?;
+                let message_id = recalled.message_id.clone();
+                let chat_id = recalled.chat_id.clone();
+                self.queue_chat_task(chat_id.clone(), async move {
+                    if let Err(err) = bridge
+                        .handle_feishu_message_recalled(&chat_id, &message_id)
+                        .await
+                    {
+                        error!("Failed to process Feishu recalled event: {}", err);
+                    }
+                })
+                .await;
+                res.status_code(StatusCode::OK);
+                res.render("accepted");
+            }
+            _ => {
+                debug!("Ignoring unsupported Feishu event type: {}", event_type);
+                res.status_code(StatusCode::OK);
+                res.render("ignored");
+            }
+        }
+
         Ok(())
     }
 
@@ -210,14 +276,70 @@ impl FeishuService {
         Ok(())
     }
 
-    fn webhook_event_to_bridge_message(&self, event: FeishuWebhookEvent) -> Result<BridgeMessage> {
-        let message = event
-            .event
-            .message
-            .ok_or_else(|| anyhow::anyhow!("No message content in webhook event"))?;
-        let parsed_content = parse_feishu_message_content(&message.content);
+    async fn verify_payload_token(&self, payload: &Value, res: &mut Response) -> Result<()> {
+        let token = payload
+            .pointer("/header/token")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("token").and_then(Value::as_str));
 
-        let (content, msg_type) = match message.msg_type.as_str() {
+        let verified = {
+            let client = self.client.lock().await;
+            client.verify_verification_token(token)
+        };
+
+        if !verified {
+            warn!("Webhook verification token check failed");
+            res.status_code(StatusCode::UNAUTHORIZED);
+            res.render("invalid verification token");
+        }
+
+        Ok(())
+    }
+
+    fn webhook_event_to_bridge_message(&self, payload: &Value) -> Result<BridgeMessage> {
+        let event = payload
+            .get("event")
+            .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
+        let message = event
+            .get("message")
+            .ok_or_else(|| anyhow::anyhow!("missing event.message object"))?;
+
+        let message_id = message
+            .get("message_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing message.message_id"))?
+            .to_string();
+        let chat_id = message
+            .get("chat_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing message.chat_id"))?
+            .to_string();
+        let msg_type = message
+            .get("msg_type")
+            .and_then(Value::as_str)
+            .unwrap_or("text")
+            .to_string();
+        let create_time = message
+            .get("create_time")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let sender = event
+            .pointer("/sender/sender_id/user_id")
+            .and_then(Value::as_str)
+            .or_else(|| event.pointer("/sender/sender_id/open_id").and_then(Value::as_str))
+            .unwrap_or("unknown")
+            .to_string();
+
+        let parsed_content = parse_feishu_message_content(
+            &message
+                .get("content")
+                .cloned()
+                .unwrap_or_else(|| Value::String(String::new())),
+        );
+
+        let mut attachments = Vec::new();
+        let (content, message_type) = match msg_type.as_str() {
             "text" => (
                 parsed_content
                     .get("text")
@@ -226,30 +348,135 @@ impl FeishuService {
                     .to_string(),
                 MessageType::Text,
             ),
-            "post" | "rich_text" => ("[Rich Text]".to_string(), MessageType::RichText),
-            "image" => ("[Image]".to_string(), MessageType::Image),
-            "file" => ("[File]".to_string(), MessageType::File),
-            "audio" => ("[Audio]".to_string(), MessageType::Audio),
-            "video" => ("[Video]".to_string(), MessageType::Video),
-            "interactive" | "card" => ("[Card]".to_string(), MessageType::Card),
-            other => (format!("[Unsupported: {}]", other), MessageType::Text),
+            "post" | "rich_text" => (
+                extract_text_from_post_content(&parsed_content),
+                MessageType::RichText,
+            ),
+            "image" => {
+                if let Some(image_key) = parsed_content.get("image_key").and_then(Value::as_str) {
+                    attachments.push(build_attachment("image", image_key, "image/*"));
+                }
+                (String::new(), MessageType::Image)
+            }
+            "file" => {
+                if let Some(file_key) = parsed_content.get("file_key").and_then(Value::as_str) {
+                    attachments.push(build_attachment(
+                        "file",
+                        file_key,
+                        "application/octet-stream",
+                    ));
+                }
+                (
+                    parsed_content
+                        .get("file_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    MessageType::File,
+                )
+            }
+            "audio" => {
+                if let Some(file_key) = parsed_content.get("file_key").and_then(Value::as_str) {
+                    attachments.push(build_attachment("audio", file_key, "audio/*"));
+                }
+                (String::new(), MessageType::Audio)
+            }
+            "media" | "video" => {
+                if let Some(file_key) = parsed_content.get("file_key").and_then(Value::as_str) {
+                    attachments.push(build_attachment("video", file_key, "video/*"));
+                }
+                (
+                    parsed_content
+                        .get("file_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    MessageType::Video,
+                )
+            }
+            "sticker" => {
+                if let Some(file_key) = parsed_content.get("file_key").and_then(Value::as_str) {
+                    attachments.push(build_attachment("sticker", file_key, "image/*"));
+                }
+                (String::new(), MessageType::Image)
+            }
+            "interactive" | "card" => (
+                extract_text_from_card_content(&parsed_content),
+                MessageType::Card,
+            ),
+            _ => (
+                parsed_content
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                MessageType::Text,
+            ),
         };
 
-        let timestamp = parse_event_timestamp(&message.create_time);
         Ok(BridgeMessage {
-            id: message.message_id,
-            sender: event.event.sender.sender_id.user_id,
-            room_id: message.chat_id,
+            id: message_id,
+            sender,
+            room_id: chat_id,
             content,
-            msg_type,
-            timestamp,
-            attachments: vec![],
+            msg_type: message_type,
+            timestamp: parse_event_timestamp(create_time),
+            attachments,
         })
     }
 
-    pub async fn get_user(&self, user_id: &str) -> Result<super::FeishuUser> {
+    fn webhook_event_to_recalled_message(&self, payload: &Value) -> Result<RecalledMessage> {
+        let event = payload
+            .get("event")
+            .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
+
+        let message_id = event
+            .get("message_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                event
+                    .get("message")
+                    .and_then(|m| m.get("message_id"))
+                    .and_then(Value::as_str)
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing recalled message_id"))?
+            .to_string();
+
+        let chat_id = event
+            .get("chat_id")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                event
+                    .get("message")
+                    .and_then(|m| m.get("chat_id"))
+                    .and_then(Value::as_str)
+            })
+            .ok_or_else(|| anyhow::anyhow!("missing recalled chat_id"))?
+            .to_string();
+
+        Ok(RecalledMessage {
+            message_id,
+            chat_id,
+        })
+    }
+
+    pub async fn get_user(&self, user_id: &str) -> Result<FeishuUser> {
         let mut client = self.client.lock().await;
         client.get_user(user_id).await
+    }
+
+    pub async fn send_message(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: Value,
+        uuid: Option<String>,
+    ) -> Result<FeishuMessageSendData> {
+        let mut client = self.client.lock().await;
+        client
+            .send_message(receive_id_type, receive_id, msg_type, content, uuid)
+            .await
     }
 
     pub async fn send_text_message(&self, chat_id: &str, content: &str) -> Result<String> {
@@ -260,15 +487,71 @@ impl FeishuService {
     pub async fn send_rich_text_message(
         &self,
         chat_id: &str,
-        rich_text: &super::FeishuRichText,
+        rich_text: &FeishuRichText,
     ) -> Result<String> {
         let mut client = self.client.lock().await;
         client.send_rich_text_message(chat_id, rich_text).await
     }
 
+    pub async fn reply_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: Value,
+        reply_in_thread: bool,
+        uuid: Option<String>,
+    ) -> Result<FeishuMessageSendData> {
+        let mut client = self.client.lock().await;
+        client
+            .reply_message(message_id, msg_type, content, reply_in_thread, uuid)
+            .await
+    }
+
+    pub async fn update_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: Value,
+    ) -> Result<FeishuMessageSendData> {
+        let mut client = self.client.lock().await;
+        client.update_message(message_id, msg_type, content).await
+    }
+
+    pub async fn recall_message(&self, message_id: &str) -> Result<()> {
+        let mut client = self.client.lock().await;
+        client.recall_message(message_id).await
+    }
+
+    pub async fn get_message(&self, message_id: &str) -> Result<Option<FeishuMessageData>> {
+        let mut client = self.client.lock().await;
+        client.get_message(message_id).await
+    }
+
+    pub async fn get_message_resource(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        resource_type: &str,
+    ) -> Result<Vec<u8>> {
+        let mut client = self.client.lock().await;
+        client
+            .get_message_resource(message_id, file_key, resource_type)
+            .await
+    }
+
     pub async fn upload_image(&self, image_data: Vec<u8>, image_type: &str) -> Result<String> {
         let mut client = self.client.lock().await;
-        client.upload_image(image_data, image_type).await
+        client.upload_image(image_data, image_type, "message").await
+    }
+
+    pub async fn upload_file(
+        &self,
+        file_name: &str,
+        file_data: Vec<u8>,
+        file_type: &str,
+    ) -> Result<String> {
+        let mut client = self.client.lock().await;
+        client.upload_file(file_name, file_data, file_type).await
     }
 }
 
@@ -300,6 +583,85 @@ fn parse_feishu_message_content(raw_content: &Value) -> Value {
             serde_json::from_str::<Value>(content).unwrap_or_else(|_| json!({ "text": content }))
         }
         _ => Value::Null,
+    }
+}
+
+fn extract_text_from_post_content(content: &Value) -> String {
+    let mut parts = Vec::new();
+
+    if let Some(locale_obj) = content.as_object() {
+        for value in locale_obj.values() {
+            if let Some(rows) = value.get("content").and_then(Value::as_array) {
+                for row in rows {
+                    if let Some(items) = row.as_array() {
+                        for item in items {
+                            let tag = item.get("tag").and_then(Value::as_str).unwrap_or("");
+                            match tag {
+                                "text" => {
+                                    if let Some(text) = item.get("text").and_then(Value::as_str) {
+                                        parts.push(text.to_string());
+                                    }
+                                }
+                                "a" => {
+                                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                                    let href = item.get("href").and_then(Value::as_str).unwrap_or("");
+                                    if text.is_empty() {
+                                        parts.push(href.to_string());
+                                    } else {
+                                        parts.push(format!("{} ({})", text, href));
+                                    }
+                                }
+                                "at" => {
+                                    let text = item
+                                        .get("user_name")
+                                        .and_then(Value::as_str)
+                                        .or_else(|| item.get("user_id").and_then(Value::as_str))
+                                        .unwrap_or("user");
+                                    parts.push(format!("@{}", text));
+                                }
+                                "img" => {
+                                    parts.push("[Image]".to_string());
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        content
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        parts.join("")
+    }
+}
+
+fn extract_text_from_card_content(content: &Value) -> String {
+    let header = content
+        .pointer("/header/title/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let body = content.to_string();
+    if header.is_empty() {
+        body
+    } else {
+        format!("{}\n{}", header, body)
+    }
+}
+
+fn build_attachment(kind: &str, key: &str, mime_type: &str) -> Attachment {
+    Attachment {
+        id: Uuid::new_v4().to_string(),
+        name: format!("{}_{}", kind, key),
+        url: format!("feishu://{}/{}", kind, key),
+        size: 0,
+        mime_type: mime_type.to_string(),
     }
 }
 

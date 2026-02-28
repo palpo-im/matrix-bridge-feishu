@@ -1,10 +1,14 @@
 use std::sync::Arc;
 
-use serde_json::Value;
+use reqwest::Client;
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use crate::bridge::command_handler::{MatrixCommandHandler, MatrixCommandOutcome};
-use crate::bridge::message_flow::{MatrixInboundMessage, MessageFlow};
+use crate::bridge::message_flow::{
+    MatrixInboundMessage, MessageAttachment, MessageFlow, OutboundFeishuMessage,
+};
 use crate::config::Config;
 use crate::database::{
     EventStore, MessageMapping, MessageStore, ProcessedEvent, RoomMapping, RoomStore,
@@ -30,6 +34,7 @@ pub struct MatrixEventProcessor {
     event_store: Arc<dyn EventStore>,
     message_flow: Arc<MessageFlow>,
     command_handler: MatrixCommandHandler,
+    http_client: Client,
 }
 
 impl MatrixEventProcessor {
@@ -50,6 +55,7 @@ impl MatrixEventProcessor {
             event_store,
             message_flow,
             command_handler: MatrixCommandHandler::new(self_service),
+            http_client: Client::new(),
         }
     }
 
@@ -135,19 +141,22 @@ impl MatrixEventProcessor {
             ..inbound
         });
 
-        let content = outbound.render_content();
-        debug!(
-            "Sending message to Feishu chat {}: {}",
-            mapping.feishu_chat_id,
-            preview_text(&content, 100)
-        );
+        if let Some(event_id) = &outbound.edit_of {
+            self.handle_edit_message(&mapping, event_id, &outbound).await?;
+            return Ok(());
+        }
 
-        let feishu_message_id = self
-            .feishu_service
-            .send_text_message(&mapping.feishu_chat_id, &content)
+        let mut primary_feishu_message_id = self.send_outbound_message(&mapping, &outbound).await?;
+
+        let attachment_message_ids = self
+            .forward_attachments_to_feishu(&mapping, &outbound.attachments)
             .await?;
+        if primary_feishu_message_id.is_none() {
+            primary_feishu_message_id = attachment_message_ids.first().cloned();
+        }
 
-        if let Some(event_id) = &event.event_id {
+        if let (Some(event_id), Some(feishu_message_id)) = (&event.event_id, primary_feishu_message_id)
+        {
             let link = MessageMapping::new(
                 event_id.clone(),
                 feishu_message_id,
@@ -169,6 +178,246 @@ impl MatrixEventProcessor {
         );
 
         Ok(())
+    }
+
+    async fn send_outbound_message(
+        &self,
+        mapping: &RoomMapping,
+        outbound: &OutboundFeishuMessage,
+    ) -> anyhow::Result<Option<String>> {
+        if outbound.content.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let (msg_type, content) = build_feishu_content_payload(&outbound.msg_type, &outbound.content)?;
+        let uuid = Some(Uuid::new_v4().to_string());
+
+        if self.config.bridge.bridge_matrix_reply {
+            if let Some(reply_to) = &outbound.reply_to {
+                if let Some(reply_mapping) = self.message_store.get_message_by_matrix_id(reply_to).await? {
+                    let response = self
+                        .feishu_service
+                        .reply_message(
+                            &reply_mapping.feishu_message_id,
+                            &msg_type,
+                            content,
+                            true,
+                            uuid,
+                        )
+                        .await?;
+                    return Ok(Some(response.message_id));
+                }
+            }
+        }
+
+        let response = self
+            .feishu_service
+            .send_message(
+                "chat_id",
+                &mapping.feishu_chat_id,
+                &msg_type,
+                content,
+                uuid,
+            )
+            .await?;
+
+        Ok(Some(response.message_id))
+    }
+
+    async fn handle_edit_message(
+        &self,
+        _mapping: &RoomMapping,
+        matrix_target_event_id: &str,
+        outbound: &OutboundFeishuMessage,
+    ) -> anyhow::Result<()> {
+        if !self.config.bridge.bridge_matrix_edit {
+            debug!("Skipping Matrix edit forwarding because bridge_matrix_edit=false");
+            return Ok(());
+        }
+
+        let target = self
+            .message_store
+            .get_message_by_matrix_id(matrix_target_event_id)
+            .await?;
+
+        let Some(target) = target else {
+            warn!(
+                "Matrix edit target event {} has no Feishu mapping",
+                matrix_target_event_id
+            );
+            return Ok(());
+        };
+
+        let (mut msg_type, content) =
+            build_feishu_content_payload(&outbound.msg_type, &outbound.content)?;
+
+        // Feishu update currently supports text/post only.
+        if msg_type != "text" && msg_type != "post" {
+            msg_type = "text".to_string();
+        }
+
+        self.feishu_service
+            .update_message(&target.feishu_message_id, &msg_type, content)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn forward_attachments_to_feishu(
+        &self,
+        mapping: &RoomMapping,
+        attachments: &[MessageAttachment],
+    ) -> anyhow::Result<Vec<String>> {
+        let mut message_ids = Vec::new();
+
+        for attachment in attachments {
+            match self
+                .forward_single_attachment(&mapping.feishu_chat_id, attachment)
+                .await
+            {
+                Ok(message_id) => message_ids.push(message_id),
+                Err(err) => warn!(
+                    "Failed to forward Matrix attachment {} to Feishu chat {}: {}",
+                    attachment.url, mapping.feishu_chat_id, err
+                ),
+            }
+        }
+
+        Ok(message_ids)
+    }
+
+    async fn forward_single_attachment(
+        &self,
+        feishu_chat_id: &str,
+        attachment: &MessageAttachment,
+    ) -> anyhow::Result<String> {
+        let bytes = self.download_matrix_media(&attachment.url).await?;
+
+        match attachment.kind.as_str() {
+            "m.image" | "m.sticker" => {
+                if !self.config.bridge.allow_images {
+                    anyhow::bail!("image bridging disabled");
+                }
+                let mime = guess_image_mime(&attachment.name);
+                let image_key = self.feishu_service.upload_image(bytes, mime).await?;
+                let response = self
+                    .feishu_service
+                    .send_message(
+                        "chat_id",
+                        feishu_chat_id,
+                        "image",
+                        json!({ "image_key": image_key }),
+                        Some(Uuid::new_v4().to_string()),
+                    )
+                    .await?;
+                Ok(response.message_id)
+            }
+            "m.audio" => {
+                if !self.config.bridge.allow_audio {
+                    anyhow::bail!("audio bridging disabled");
+                }
+                let file_type = guess_file_type(&attachment.name, "m.audio");
+                let file_key = self
+                    .feishu_service
+                    .upload_file(&attachment.name, bytes, file_type)
+                    .await?;
+                let response = self
+                    .feishu_service
+                    .send_message(
+                        "chat_id",
+                        feishu_chat_id,
+                        "audio",
+                        json!({ "file_key": file_key }),
+                        Some(Uuid::new_v4().to_string()),
+                    )
+                    .await?;
+                Ok(response.message_id)
+            }
+            "m.video" => {
+                if !self.config.bridge.allow_videos {
+                    anyhow::bail!("video bridging disabled");
+                }
+                let file_type = guess_file_type(&attachment.name, "m.video");
+                let file_key = self
+                    .feishu_service
+                    .upload_file(&attachment.name, bytes, file_type)
+                    .await?;
+                let response = self
+                    .feishu_service
+                    .send_message(
+                        "chat_id",
+                        feishu_chat_id,
+                        "media",
+                        json!({ "file_key": file_key }),
+                        Some(Uuid::new_v4().to_string()),
+                    )
+                    .await?;
+                Ok(response.message_id)
+            }
+            _ => {
+                if !self.config.bridge.allow_files {
+                    anyhow::bail!("file bridging disabled");
+                }
+                let file_type = guess_file_type(&attachment.name, "m.file");
+                let file_key = self
+                    .feishu_service
+                    .upload_file(&attachment.name, bytes, file_type)
+                    .await?;
+                let response = self
+                    .feishu_service
+                    .send_message(
+                        "chat_id",
+                        feishu_chat_id,
+                        "file",
+                        json!({ "file_key": file_key }),
+                        Some(Uuid::new_v4().to_string()),
+                    )
+                    .await?;
+                Ok(response.message_id)
+            }
+        }
+    }
+
+    async fn download_matrix_media(&self, source_url: &str) -> anyhow::Result<Vec<u8>> {
+        let url = if let Some(path) = source_url.strip_prefix("mxc://") {
+            format!(
+                "{}/_matrix/media/v3/download/{}",
+                self.config.homeserver.address.trim_end_matches('/'),
+                path
+            )
+        } else {
+            source_url.to_string()
+        };
+
+        let response = self
+            .http_client
+            .get(url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.config.appservice.as_token),
+            )
+            .send()
+            .await?;
+
+        let status = response.status();
+        let bytes = response.bytes().await?.to_vec();
+        if !status.is_success() {
+            anyhow::bail!(
+                "failed to download matrix media: status={} body={}",
+                status,
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        if self.config.bridge.max_media_size > 0 && bytes.len() > self.config.bridge.max_media_size {
+            anyhow::bail!(
+                "matrix media exceeds configured max_media_size: {} > {}",
+                bytes.len(),
+                self.config.bridge.max_media_size
+            );
+        }
+
+        Ok(bytes)
     }
 
     async fn handle_command(&self, event: &MatrixEvent, body: &str) -> anyhow::Result<()> {
@@ -268,11 +517,41 @@ impl MatrixEventProcessor {
             return Ok(());
         }
 
-        let Some(redacts) = event.content.as_ref().and_then(|c| c.get("redacts")) else {
+        let redacts_event_id = event
+            .content
+            .as_ref()
+            .and_then(|c| c.get("redacts"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        let Some(redacts_event_id) = redacts_event_id else {
             return Ok(());
         };
 
-        debug!("Redaction event for: {:?}", redacts);
+        let mapping = self
+            .message_store
+            .get_message_by_matrix_id(&redacts_event_id)
+            .await?;
+
+        let Some(mapping) = mapping else {
+            debug!(
+                "No Matrix->Feishu mapping found for redacted event {}",
+                redacts_event_id
+            );
+            return Ok(());
+        };
+
+        self.feishu_service
+            .recall_message(&mapping.feishu_message_id)
+            .await?;
+
+        if let Err(err) = self.message_store.delete_message_mapping(mapping.id).await {
+            warn!(
+                "Failed to delete mapping after redaction {}: {}",
+                redacts_event_id, err
+            );
+        }
+
         Ok(())
     }
 
@@ -291,11 +570,43 @@ impl MatrixEventProcessor {
     }
 }
 
-fn preview_text(text: &str, max_len: usize) -> String {
-    let chars: String = text.chars().take(max_len).collect();
-    if text.len() > max_len {
-        format!("{}...", chars)
-    } else {
-        chars
+fn build_feishu_content_payload(msg_type: &str, body: &str) -> anyhow::Result<(String, Value)> {
+    if msg_type == "post" {
+        let post = crate::formatter::create_feishu_rich_text(body);
+        let post_json = serde_json::from_str::<Value>(&post)
+            .unwrap_or_else(|_| json!({ "zh_cn": { "title": "", "content": [[{"tag": "text", "text": body}]] } }));
+        return Ok(("post".to_string(), post_json));
+    }
+
+    Ok(("text".to_string(), json!({ "text": body })))
+}
+
+fn guess_image_mime(name: &str) -> &'static str {
+    let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "webp" => "image/webp",
+        _ => "image/png",
+    }
+}
+
+fn guess_file_type(name: &str, kind: &str) -> &'static str {
+    if kind == "m.audio" {
+        return "opus";
+    }
+    if kind == "m.video" {
+        return "mp4";
+    }
+
+    let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    match ext.as_str() {
+        "pdf" => "pdf",
+        "doc" | "docx" => "doc",
+        "xls" | "xlsx" => "xls",
+        "ppt" | "pptx" => "ppt",
+        "mp4" => "mp4",
+        _ => "stream",
     }
 }

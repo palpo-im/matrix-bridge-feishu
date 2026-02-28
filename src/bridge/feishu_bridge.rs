@@ -48,7 +48,7 @@ pub struct FeishuBridge {
     intents: Arc<RwLock<HashMap<String, Intent>>>,
     command_handler: Arc<MatrixCommandHandler>,
     provisioning: Arc<ProvisioningCoordinator>,
-    presence_handler: Arc<PresenceHandler>,
+    _presence_handler: Arc<PresenceHandler>,
     started_at: Instant,
 }
 
@@ -115,7 +115,7 @@ impl FeishuBridge {
             intents: Arc::new(RwLock::new(HashMap::new())),
             command_handler,
             provisioning,
-            presence_handler,
+            _presence_handler: presence_handler,
             started_at: Instant::now(),
         })
     }
@@ -308,23 +308,84 @@ impl FeishuBridge {
             .await;
         intent.ensure_registered().await?;
 
-        let matrix_text = formatter::convert_feishu_content_to_matrix_html(&message.content);
-        let matrix_event_id = intent.send_text(&portal.mxid, &matrix_text).await?;
+        let mut primary_matrix_event_id = None;
+        if !message.content.trim().is_empty() {
+            let event_id = intent.send_text(&portal.mxid, &message.content).await?;
+            primary_matrix_event_id = Some(event_id);
+        }
 
-        let link = MessageMapping::new(
-            matrix_event_id,
-            message.id,
-            portal.mxid.clone(),
-            portal.bridge_info.bridgebot.clone(),
-            message.sender,
+        let attachment_event_ids = self
+            .forward_feishu_attachments_to_matrix(&intent, &portal.mxid, &message)
+            .await?;
+        if primary_matrix_event_id.is_none() {
+            primary_matrix_event_id = attachment_event_ids.first().cloned();
+        }
+
+        if let Some(matrix_event_id) = primary_matrix_event_id {
+            let link = MessageMapping::new(
+                matrix_event_id,
+                message.id,
+                portal.mxid.clone(),
+                portal.bridge_info.bridgebot.clone(),
+                message.sender,
+            );
+            if let Err(err) = self
+                .stores
+                .message_store()
+                .create_message_mapping(&link)
+                .await
+            {
+                warn!("Failed to persist Feishu->Matrix message mapping: {}", err);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn handle_feishu_message_recalled(
+        &self,
+        feishu_chat_id: &str,
+        feishu_message_id: &str,
+    ) -> anyhow::Result<()> {
+        info!(
+            "Handling Feishu recalled event: chat={} message={}",
+            feishu_chat_id, feishu_message_id
         );
-        if let Err(err) = self
+
+        let mapping = self
             .stores
             .message_store()
-            .create_message_mapping(&link)
+            .get_message_by_feishu_id(feishu_message_id)
+            .await?;
+
+        let Some(mapping) = mapping else {
+            debug!(
+                "No message mapping found for recalled Feishu message {}",
+                feishu_message_id
+            );
+            return Ok(());
+        };
+
+        if let Err(err) = self
+            .bot_intent
+            .redact_event(
+                &mapping.room_id,
+                &mapping.matrix_event_id,
+                Some("Message recalled in Feishu"),
+            )
             .await
         {
-            warn!("Failed to persist Feishu->Matrix message mapping: {}", err);
+            warn!(
+                "Failed to redact Matrix event {} for Feishu message {}: {}",
+                mapping.matrix_event_id, feishu_message_id, err
+            );
+        }
+
+        if let Err(err) = self.stores.message_store().delete_message_mapping(mapping.id).await {
+            warn!(
+                "Failed to delete recalled message mapping {} (Feishu {}): {}",
+                mapping.id, feishu_message_id, err
+            );
         }
 
         Ok(())
@@ -555,6 +616,88 @@ impl FeishuBridge {
             attachments: vec![],
         })
     }
+
+    async fn forward_feishu_attachments_to_matrix(
+        &self,
+        intent: &Intent,
+        matrix_room_id: &str,
+        message: &BridgeMessage,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut event_ids = Vec::new();
+
+        for attachment in &message.attachments {
+            match self
+                .forward_single_feishu_attachment(intent, matrix_room_id, &message.id, attachment)
+                .await
+            {
+                Ok(event_id) => event_ids.push(event_id),
+                Err(err) => warn!(
+                    "Failed to forward Feishu attachment {} for message {}: {}",
+                    attachment.url, message.id, err
+                ),
+            }
+        }
+
+        Ok(event_ids)
+    }
+
+    async fn forward_single_feishu_attachment(
+        &self,
+        intent: &Intent,
+        matrix_room_id: &str,
+        feishu_message_id: &str,
+        attachment: &super::message::Attachment,
+    ) -> anyhow::Result<String> {
+        let (kind, key) = parse_feishu_attachment_url(&attachment.url)
+            .ok_or_else(|| anyhow::anyhow!("invalid feishu attachment url: {}", attachment.url))?;
+
+        let resource_type = feishu_resource_type_for_kind(kind).ok_or_else(|| {
+            anyhow::anyhow!("unsupported feishu attachment kind '{}'", kind)
+        })?;
+
+        let bytes = self
+            .feishu_service
+            .get_message_resource(feishu_message_id, key, resource_type)
+            .await?;
+
+        if self.config.bridge.max_media_size > 0 && bytes.len() > self.config.bridge.max_media_size {
+            anyhow::bail!(
+                "feishu attachment exceeds configured max_media_size: {} > {}",
+                bytes.len(),
+                self.config.bridge.max_media_size
+            );
+        }
+
+        let mime_type = if attachment.mime_type.is_empty() || attachment.mime_type.ends_with("/*") {
+            default_mime_for_kind(kind).to_string()
+        } else {
+            attachment.mime_type.clone()
+        };
+        let file_name = if attachment.name.is_empty() {
+            format!("{}_{}", kind, key)
+        } else {
+            attachment.name.clone()
+        };
+
+        let mxc = intent
+            .underlying_client()
+            .upload_media(bytes.clone(), &mime_type, Some(&file_name))
+            .await?;
+
+        let content = json!({
+            "msgtype": matrix_msgtype_for_kind(kind),
+            "body": file_name,
+            "url": mxc.as_str(),
+            "info": {
+                "mimetype": mime_type,
+                "size": bytes.len() as u64
+            }
+        });
+
+        intent
+            .send_event(matrix_room_id, "m.room.message", &content)
+            .await
+    }
 }
 
 fn sanitize_identifier(input: &str) -> String {
@@ -566,6 +709,45 @@ fn sanitize_identifier(input: &str) -> String {
         "unknown".to_string()
     } else {
         sanitized
+    }
+}
+
+fn parse_feishu_attachment_url(url: &str) -> Option<(&str, &str)> {
+    let stripped = url.strip_prefix("feishu://")?;
+    let mut parts = stripped.splitn(2, '/');
+    let kind = parts.next()?;
+    let key = parts.next()?;
+    if kind.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((kind, key))
+}
+
+fn feishu_resource_type_for_kind(kind: &str) -> Option<&'static str> {
+    match kind {
+        "image" | "sticker" => Some("image"),
+        "file" => Some("file"),
+        "audio" => Some("audio"),
+        "video" => Some("media"),
+        _ => None,
+    }
+}
+
+fn matrix_msgtype_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "image" | "sticker" => "m.image",
+        "audio" => "m.audio",
+        "video" => "m.video",
+        _ => "m.file",
+    }
+}
+
+fn default_mime_for_kind(kind: &str) -> &'static str {
+    match kind {
+        "image" | "sticker" => "image/png",
+        "audio" => "audio/ogg",
+        "video" => "video/mp4",
+        _ => "application/octet-stream",
     }
 }
 

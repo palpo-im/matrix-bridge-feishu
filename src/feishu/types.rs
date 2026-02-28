@@ -244,3 +244,68 @@ pub struct FeishuWebhookChat {
     pub chat_type: String,
     pub name: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuApiEnvelope<T> {
+    pub code: i64,
+    pub msg: String,
+    pub data: Option<T>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageSendData {
+    pub message_id: String,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageListData {
+    #[serde(default)]
+    pub items: Vec<FeishuMessageData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageData {
+    pub message_id: String,
+    pub root_id: Option<String>,
+    pub parent_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub msg_type: Option<String>,
+    pub chat_id: Option<String>,
+    pub deleted: Option<bool>,
+    pub updated: Option<bool>,
+    pub create_time: Option<String>,
+    pub update_time: Option<String>,
+    pub body: Option<FeishuMessageBody>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageBody {
+    pub content: Option<String>,
+    pub mentions: Option<Vec<FeishuMessageMention>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageMention {
+    pub key: Option<String>,
+    pub name: Option<String>,
+    pub id: Option<FeishuMessageMentionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuMessageMentionId {
+    pub id: Option<String>,
+    pub id_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuImageUploadData {
+    pub image_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeishuFileUploadData {
+    pub file_key: String,
+}

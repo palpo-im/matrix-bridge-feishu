@@ -4,8 +4,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose;
 use cbc::cipher::block_padding::Pkcs7;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit};
-use reqwest::Client;
-use serde_json::Value;
+use reqwest::{Client, RequestBuilder};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracing::debug;
 use uuid::Uuid;
@@ -13,6 +14,11 @@ use uuid::Uuid;
 use super::types::*;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
+
+const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
+const IMAGE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
+const FILE_SIZE_LIMIT: usize = 30 * 1024 * 1024;
+const RESOURCE_DOWNLOAD_LIMIT: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct FeishuClient {
@@ -46,102 +52,255 @@ impl FeishuClient {
     pub async fn get_tenant_access_token(&mut self) -> Result<String> {
         if let Some(expires_at) = self.token_expires_at {
             if chrono::Utc::now() < expires_at {
-                return Ok(self.access_token.clone().unwrap());
+                return Ok(self.access_token.clone().unwrap_or_default());
             }
         }
 
-        let url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal";
-
-        let payload = serde_json::json!({
+        let url = format!("{}/auth/v3/tenant_access_token/internal", FEISHU_API_BASE);
+        let payload = json!({
             "app_id": self.app_id,
-            "app_secret": self.app_secret
+            "app_secret": self.app_secret,
         });
 
-        let response = self.client.post(url).json(&payload).send().await?;
+        let response = self
+            .execute_json(self.client.post(url).json(&payload))
+            .await
+            .context("failed to call tenant_access_token/internal")?;
 
-        let json: Value = response.json().await?;
-
-        if json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-            return Err(anyhow::anyhow!(
-                "Failed to get tenant access token: {:?}",
-                json
-            ));
+        #[derive(serde::Deserialize)]
+        struct TenantTokenData {
+            tenant_access_token: String,
+            expire: i64,
         }
 
-        let access_token = json
-            .get("tenant_access_token")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No tenant_access_token in response"))?
-            .to_string();
+        let data: TenantTokenData =
+            Self::parse_data("auth/v3/tenant_access_token/internal", response)?;
 
-        // Set token to expire in 1 hour (Feishu tokens are valid for 2 hours)
-        self.token_expires_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
-        self.access_token = Some(access_token.clone());
+        // Refresh 5 minutes earlier to avoid using near-expiry token.
+        let valid_for_secs = (data.expire - 300).max(60);
+        self.token_expires_at =
+            Some(chrono::Utc::now() + chrono::Duration::seconds(valid_for_secs));
+        self.access_token = Some(data.tenant_access_token.clone());
 
-        Ok(access_token)
+        Ok(data.tenant_access_token)
     }
 
     pub async fn get_user(&mut self, user_id: &str) -> Result<FeishuUser> {
         let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/contact/v3/users/{}", FEISHU_API_BASE, user_id);
+
+        let response = self
+            .execute_json(
+                self.client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", access_token)),
+            )
+            .await
+            .context("failed to call contact/v3/users/get")?;
+
+        #[derive(serde::Deserialize)]
+        struct UserWrapper {
+            user: FeishuUser,
+        }
+
+        let data: UserWrapper = Self::parse_data("contact/v3/users/get", response)?;
+        Ok(data.user)
+    }
+
+    pub async fn send_message(
+        &mut self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: Value,
+        uuid: Option<String>,
+    ) -> Result<FeishuMessageSendData> {
+        self.create_message(receive_id_type, receive_id, msg_type, content, uuid)
+            .await
+    }
+
+    pub async fn create_message(
+        &mut self,
+        receive_id_type: &str,
+        receive_id: &str,
+        msg_type: &str,
+        content: Value,
+        uuid: Option<String>,
+    ) -> Result<FeishuMessageSendData> {
+        let access_token = self.get_tenant_access_token().await?;
         let url = format!(
-            "https://open.feishu.cn/open-apis/contact/v3/users/{}",
-            user_id
+            "{}/im/v1/messages?receive_id_type={}",
+            FEISHU_API_BASE, receive_id_type
+        );
+        let payload = Self::build_message_payload(receive_id, msg_type, content, uuid)?;
+
+        let response = self
+            .execute_json(
+                self.client
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .json(&payload),
+            )
+            .await
+            .context("failed to call im/v1/message/create")?;
+
+        Self::parse_data("im/v1/message/create", response)
+    }
+
+    pub async fn reply_message(
+        &mut self,
+        message_id: &str,
+        msg_type: &str,
+        content: Value,
+        reply_in_thread: bool,
+        uuid: Option<String>,
+    ) -> Result<FeishuMessageSendData> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}/reply", FEISHU_API_BASE, message_id);
+
+        let mut payload = json!({
+            "msg_type": msg_type,
+            "content": serde_json::to_string(&content)
+                .context("failed to serialize reply message content")?,
+        });
+
+        if reply_in_thread {
+            payload["reply_in_thread"] = Value::Bool(true);
+        }
+        if let Some(uuid) = uuid {
+            payload["uuid"] = Value::String(uuid);
+        }
+
+        let response = self
+            .execute_json(
+                self.client
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .json(&payload),
+            )
+            .await
+            .context("failed to call im/v1/message/reply")?;
+
+        Self::parse_data("im/v1/message/reply", response)
+    }
+
+    pub async fn update_message(
+        &mut self,
+        message_id: &str,
+        msg_type: &str,
+        content: Value,
+    ) -> Result<FeishuMessageSendData> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+        let payload = json!({
+            "msg_type": msg_type,
+            "content": serde_json::to_string(&content)
+                .context("failed to serialize update message content")?,
+        });
+
+        let response = self
+            .execute_json(
+                self.client
+                    .put(url)
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .json(&payload),
+            )
+            .await
+            .context("failed to call im/v1/message/update")?;
+
+        Self::parse_data("im/v1/message/update", response)
+    }
+
+    pub async fn recall_message(&mut self, message_id: &str) -> Result<()> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+
+        let response = self
+            .execute_json(
+                self.client
+                    .delete(url)
+                    .header("Authorization", format!("Bearer {}", access_token)),
+            )
+            .await
+            .context("failed to call im/v1/message/delete")?;
+
+        Self::ensure_ok("im/v1/message/delete", response)
+    }
+
+    pub async fn get_message(&mut self, message_id: &str) -> Result<Option<FeishuMessageData>> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+
+        let response = self
+            .execute_json(
+                self.client
+                    .get(url)
+                    .header("Authorization", format!("Bearer {}", access_token)),
+            )
+            .await
+            .context("failed to call im/v1/message/get")?;
+
+        let data: FeishuMessageListData = Self::parse_data("im/v1/message/get", response)?;
+        Ok(data.items.into_iter().next())
+    }
+
+    pub async fn get_message_resource(
+        &mut self,
+        message_id: &str,
+        file_key: &str,
+        resource_type: &str,
+    ) -> Result<Vec<u8>> {
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!(
+            "{}/im/v1/messages/{}/resources/{}?type={}",
+            FEISHU_API_BASE, message_id, file_key, resource_type
         );
 
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .header("Authorization", format!("Bearer {}", access_token))
             .send()
-            .await?;
+            .await
+            .context("failed to call im/v1/message-resource/get")?;
 
-        let json: Value = response.json().await?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read message resource response body")?
+            .to_vec();
 
-        if json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-            return Err(anyhow::anyhow!("Failed to get user: {:?}", json));
+        if !status.is_success() {
+            let detail = String::from_utf8_lossy(&body);
+            anyhow::bail!(
+                "Feishu im/v1/message-resource/get failed: status={} body={}",
+                status,
+                detail
+            );
         }
 
-        let data = json
-            .get("data")
-            .ok_or_else(|| anyhow::anyhow!("No data in response"))?;
-        let user: FeishuUser = serde_json::from_value(data.clone())?;
+        if body.len() > RESOURCE_DOWNLOAD_LIMIT {
+            anyhow::bail!(
+                "Feishu message resource exceeds {} bytes limit",
+                RESOURCE_DOWNLOAD_LIMIT
+            );
+        }
 
-        Ok(user)
+        Ok(body)
     }
 
     pub async fn send_text_message(&mut self, chat_id: &str, content: &str) -> Result<String> {
-        let access_token = self.get_tenant_access_token().await?;
-        let url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id";
-
-        let payload = Self::build_message_payload(
-            chat_id,
-            "text",
-            serde_json::json!({ "text": content }),
-            Some(Uuid::new_v4().to_string()),
-        )?;
-
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .json(&payload)
-            .send()
+        let data = self
+            .create_message(
+                "chat_id",
+                chat_id,
+                "text",
+                json!({ "text": content }),
+                Some(Uuid::new_v4().to_string()),
+            )
             .await?;
-
-        let json: Value = response.json().await?;
-
-        if json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-            return Err(anyhow::anyhow!("Failed to send message: {:?}", json));
-        }
-
-        let message_id = json
-            .get("data")
-            .and_then(|d| d.get("message_id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No message_id in response"))?
-            .to_string();
-
-        Ok(message_id)
+        Ok(data.message_id)
     }
 
     pub async fn send_rich_text_message(
@@ -149,72 +308,97 @@ impl FeishuClient {
         chat_id: &str,
         rich_text: &FeishuRichText,
     ) -> Result<String> {
-        let access_token = self.get_tenant_access_token().await?;
-        let url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id";
-        let payload = Self::build_message_payload(
-            chat_id,
-            "post",
-            serde_json::to_value(rich_text).context("failed to serialize rich text payload")?,
-            Some(Uuid::new_v4().to_string()),
-        )?;
-
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .json(&payload)
-            .send()
+        let content = serde_json::to_value(rich_text).context("failed to serialize rich text")?;
+        let data = self
+            .create_message(
+                "chat_id",
+                chat_id,
+                "post",
+                content,
+                Some(Uuid::new_v4().to_string()),
+            )
             .await?;
-
-        let json: Value = response.json().await?;
-
-        if json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-            return Err(anyhow::anyhow!("Failed to send rich text: {:?}", json));
-        }
-
-        let message_id = json
-            .get("data")
-            .and_then(|d| d.get("message_id"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No message_id in response"))?
-            .to_string();
-
-        Ok(message_id)
+        Ok(data.message_id)
     }
 
-    pub async fn upload_image(&mut self, image_data: Vec<u8>, image_type: &str) -> Result<String> {
-        let access_token = self.get_tenant_access_token().await?;
-        let url = "https://open.feishu.cn/open-apis/im/v1/images";
-
-        let form = reqwest::multipart::Form::new().part(
-            "image",
-            reqwest::multipart::Part::bytes(image_data)
-                .file_name("image")
-                .mime_str(image_type)?,
-        );
-
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", format!("Bearer {}", access_token))
-            .multipart(form)
-            .send()
-            .await?;
-
-        let json: Value = response.json().await?;
-
-        if json.get("code").and_then(|v| v.as_i64()) != Some(0) {
-            return Err(anyhow::anyhow!("Failed to upload image: {:?}", json));
+    pub async fn upload_image(
+        &mut self,
+        image_data: Vec<u8>,
+        image_type: &str,
+        image_use: &str,
+    ) -> Result<String> {
+        if image_data.is_empty() {
+            anyhow::bail!("image payload cannot be empty");
+        }
+        if image_data.len() > IMAGE_SIZE_LIMIT {
+            anyhow::bail!("image payload exceeds {} bytes", IMAGE_SIZE_LIMIT);
         }
 
-        let image_key = json
-            .get("data")
-            .and_then(|d| d.get("image_key"))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("No image_key in response"))?
-            .to_string();
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/images", FEISHU_API_BASE);
 
-        Ok(image_key)
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", image_use.to_string())
+            .part(
+                "image",
+                reqwest::multipart::Part::bytes(image_data)
+                    .file_name("image")
+                    .mime_str(image_type)
+                    .context("invalid image mime type")?,
+            );
+
+        let response = self
+            .execute_json(
+                self.client
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .multipart(form),
+            )
+            .await
+            .context("failed to call im/v1/image/create")?;
+
+        let data: FeishuImageUploadData = Self::parse_data("im/v1/image/create", response)?;
+        Ok(data.image_key)
+    }
+
+    pub async fn upload_file(
+        &mut self,
+        file_name: &str,
+        file_data: Vec<u8>,
+        file_type: &str,
+    ) -> Result<String> {
+        if file_data.is_empty() {
+            anyhow::bail!("file payload cannot be empty");
+        }
+        if file_data.len() > FILE_SIZE_LIMIT {
+            anyhow::bail!("file payload exceeds {} bytes", FILE_SIZE_LIMIT);
+        }
+
+        let access_token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/files", FEISHU_API_BASE);
+
+        let part = reqwest::multipart::Part::bytes(file_data)
+            .file_name(file_name.to_string())
+            .mime_str("application/octet-stream")
+            .context("invalid file mime type")?;
+
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", file_type.to_string())
+            .text("file_name", file_name.to_string())
+            .part("file", part);
+
+        let response = self
+            .execute_json(
+                self.client
+                    .post(url)
+                    .header("Authorization", format!("Bearer {}", access_token))
+                    .multipart(form),
+            )
+            .await
+            .context("failed to call im/v1/file/create")?;
+
+        let data: FeishuFileUploadData = Self::parse_data("im/v1/file/create", response)?;
+        Ok(data.file_key)
     }
 
     pub fn verify_webhook_signature(
@@ -281,13 +465,74 @@ impl FeishuClient {
             .or_else(|| (!fallback_secret.is_empty()).then_some(fallback_secret))
     }
 
+    async fn execute_json(&self, request: RequestBuilder) -> Result<Value> {
+        let response = request.send().await.context("request failed")?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .context("failed to read response body")?;
+
+        let json: Value = serde_json::from_slice(&body).with_context(|| {
+            format!(
+                "response is not valid JSON: status={} body={}",
+                status,
+                String::from_utf8_lossy(&body)
+            )
+        })?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "http status indicates failure: status={} body={}",
+                status,
+                json
+            );
+        }
+
+        Ok(json)
+    }
+
+    fn ensure_ok(api_name: &str, json: Value) -> Result<()> {
+        let envelope: FeishuApiEnvelope<Value> = serde_json::from_value(json.clone())
+            .with_context(|| format!("{}: failed to parse envelope body={}", api_name, json))?;
+        if envelope.code != 0 {
+            anyhow::bail!(
+                "Feishu {} failed: code={} msg={} body={}",
+                api_name,
+                envelope.code,
+                envelope.msg,
+                json
+            );
+        }
+        Ok(())
+    }
+
+    fn parse_data<T: DeserializeOwned>(api_name: &str, json: Value) -> Result<T> {
+        let envelope: FeishuApiEnvelope<T> = serde_json::from_value(json.clone())
+            .with_context(|| format!("{}: failed to parse envelope body={}", api_name, json))?;
+
+        if envelope.code != 0 {
+            anyhow::bail!(
+                "Feishu {} failed: code={} msg={} body={}",
+                api_name,
+                envelope.code,
+                envelope.msg,
+                json
+            );
+        }
+
+        envelope
+            .data
+            .ok_or_else(|| anyhow::anyhow!("Feishu {} response data is missing", api_name))
+    }
+
     fn build_message_payload(
         receive_id: &str,
         msg_type: &str,
         content: Value,
         uuid: Option<String>,
     ) -> Result<Value> {
-        let mut payload = serde_json::json!({
+        let mut payload = json!({
             "receive_id": receive_id,
             "msg_type": msg_type,
             "content": serde_json::to_string(&content)
