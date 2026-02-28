@@ -1,8 +1,8 @@
 [package]
 name = "matrix-bridge-feishu"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.93"
 authors = ["Matrix Feishu Bridge Contributors"]
 description = "A Matrix-Feishu puppeting bridge"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ repository = "https://github.com/palpo-im/matrix-bridge-feishu"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-salvo = { version = "0.89.1", default-features = false, features = [
+salvo = { version = "0.89.2", default-features = false, features = [
     "server",
     "http1",
     "logging",
@@ -47,9 +47,9 @@ aes = "0.8"
 cbc = "0.1"
 hex = "0.4"
 url = "2"
-matrix-bot-sdk = "0.2.0"
+matrix-bot-sdk = "0.2.4"
 parking_lot = "0.12"
-lru = "0.13"
+lru = "0.16.3"
 
 [profile.release]
 lto = true

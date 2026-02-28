@@ -31,7 +31,7 @@
 
 ### 前置要求
 
-- Rust 1.75+
+- Rust 1.93+
 - SQLite
 - Matrix homeserver（Synapse、Dendrite 等）
 - 飞书应用凭据
@@ -219,7 +219,7 @@ src/
 ### Docker
 
 ```dockerfile
-FROM rust:1.75 as builder
+FROM rust:1.93 as builder
 WORKDIR /app
 COPY . .
 RUN cargo build --release
