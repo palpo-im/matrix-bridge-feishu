@@ -9,11 +9,10 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use super::{
-    FeishuClient, FeishuMessageData, FeishuMessageSendData, FeishuRichText, FeishuUser,
-};
+use super::{FeishuClient, FeishuMessageData, FeishuMessageSendData, FeishuRichText, FeishuUser};
 use crate::bridge::FeishuBridge;
 use crate::bridge::message::{Attachment, BridgeMessage, MessageType};
+use crate::util::parse_feishu_api_error;
 use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Clone)]
@@ -207,6 +206,24 @@ impl FeishuService {
         info!(event_type = %event_type, "Received Feishu event");
         global_metrics().record_inbound_event(&event_type);
 
+        let header_event_id = payload
+            .pointer("/header/event_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+
+        if let Some(ref event_id) = header_event_id {
+            if bridge.is_feishu_event_processed(event_id).await? {
+                debug!(
+                    event_id = %event_id,
+                    event_type = %event_type,
+                    "Skipping duplicate Feishu webhook event"
+                );
+                res.status_code(StatusCode::OK);
+                res.render("duplicate");
+                return Ok(());
+            }
+        }
+
         match event_type.as_str() {
             "im.message.receive_v1" | "message.receive_v1" => {
                 let bridge_message = self
@@ -214,8 +231,21 @@ impl FeishuService {
                     .context("failed to parse receive event")?;
                 let chat_id = bridge_message.room_id.clone();
                 let feishu_message_id = bridge_message.id.clone();
+                let bridge_message_for_task = bridge_message.clone();
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "message": bridge_message
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task
+                        .clone()
+                        .unwrap_or_else(|| feishu_message_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
-                    if let Err(err) = bridge.handle_feishu_message(bridge_message).await {
+                    if let Err(err) = bridge.handle_feishu_message(bridge_message_for_task).await {
                         error!(
                             event_type = "im.message.receive_v1",
                             chat_id = %chat_id,
@@ -223,6 +253,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu receive event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -235,6 +297,19 @@ impl FeishuService {
                     .context("failed to parse recalled event")?;
                 let message_id = recalled.message_id.clone();
                 let chat_id = recalled.chat_id.clone();
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task
+                        .clone()
+                        .unwrap_or_else(|| message_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
                         .handle_feishu_message_recalled(&chat_id, &message_id)
@@ -247,6 +322,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu recalled event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -258,9 +365,21 @@ impl FeishuService {
                     .webhook_event_to_chat_member_change(&payload)
                     .context("failed to parse member added event")?;
                 let chat_id = event.chat_id.clone();
+                let user_ids = event.user_ids.clone();
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "chat_id": event.chat_id,
+                    "user_ids": event.user_ids
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
-                        .handle_feishu_chat_member_added(&chat_id, &event.user_ids)
+                        .handle_feishu_chat_member_added(&chat_id, &user_ids)
                         .await
                     {
                         error!(
@@ -269,6 +388,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu member added event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -280,9 +431,21 @@ impl FeishuService {
                     .webhook_event_to_chat_member_change(&payload)
                     .context("failed to parse member deleted event")?;
                 let chat_id = event.chat_id.clone();
+                let user_ids = event.user_ids.clone();
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "chat_id": event.chat_id,
+                    "user_ids": event.user_ids
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
-                        .handle_feishu_chat_member_deleted(&chat_id, &event.user_ids)
+                        .handle_feishu_chat_member_deleted(&chat_id, &user_ids)
                         .await
                     {
                         error!(
@@ -291,6 +454,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu member deleted event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -302,14 +497,25 @@ impl FeishuService {
                     .webhook_event_to_chat_updated(&payload)
                     .context("failed to parse chat updated event")?;
                 let chat_id = event.chat_id.clone();
+                let chat_name = event.chat_name.clone();
+                let chat_mode = event.chat_mode.clone();
+                let chat_type = event.chat_type.clone();
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "chat_id": event.chat_id,
+                    "chat_name": event.chat_name,
+                    "chat_mode": event.chat_mode,
+                    "chat_type": event.chat_type
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
-                        .handle_feishu_chat_updated(
-                            &chat_id,
-                            event.chat_name,
-                            event.chat_mode,
-                            event.chat_type,
-                        )
+                        .handle_feishu_chat_updated(&chat_id, chat_name, chat_mode, chat_type)
                         .await
                     {
                         error!(
@@ -318,6 +524,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu chat updated event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -328,6 +566,16 @@ impl FeishuService {
                 let chat_id = self
                     .webhook_event_to_chat_disbanded(&payload)
                     .context("failed to parse chat disbanded event")?;
+                let event_type_for_task = event_type.clone();
+                let event_id_for_task = header_event_id.clone();
+                let dead_letter_payload = json!({
+                    "chat_id": chat_id
+                });
+                let dedupe_key = format!(
+                    "{}:{}",
+                    event_type_for_task,
+                    event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
+                );
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge.handle_feishu_chat_disbanded(&chat_id).await {
                         error!(
@@ -336,6 +584,38 @@ impl FeishuService {
                             error = %err,
                             "Failed to process Feishu chat disbanded event"
                         );
+                        if let Err(store_err) = bridge
+                            .record_dead_letter(
+                                &event_type_for_task,
+                                &dedupe_key,
+                                Some(chat_id.clone()),
+                                dead_letter_payload.clone(),
+                                &err.to_string(),
+                            )
+                            .await
+                        {
+                            warn!(
+                                event_type = %event_type_for_task,
+                                chat_id = %chat_id,
+                                error = %store_err,
+                                "Failed to persist dead-letter event"
+                            );
+                        }
+                        return;
+                    }
+
+                    if let Some(event_id) = &event_id_for_task {
+                        if let Err(err) = bridge
+                            .mark_feishu_event_processed(event_id, &event_type_for_task)
+                            .await
+                        {
+                            warn!(
+                                event_id = %event_id,
+                                event_type = %event_type_for_task,
+                                error = %err,
+                                "Failed to mark Feishu event as processed"
+                            );
+                        }
                     }
                 })
                 .await;
@@ -460,7 +740,11 @@ impl FeishuService {
         let sender = event
             .pointer("/sender/sender_id/user_id")
             .and_then(Value::as_str)
-            .or_else(|| event.pointer("/sender/sender_id/open_id").and_then(Value::as_str))
+            .or_else(|| {
+                event
+                    .pointer("/sender/sender_id/open_id")
+                    .and_then(Value::as_str)
+            })
             .unwrap_or("unknown")
             .to_string();
 
@@ -596,7 +880,10 @@ impl FeishuService {
         })
     }
 
-    fn webhook_event_to_chat_member_change(&self, payload: &Value) -> Result<ChatMemberChangedEvent> {
+    fn webhook_event_to_chat_member_change(
+        &self,
+        payload: &Value,
+    ) -> Result<ChatMemberChangedEvent> {
         let event = payload
             .get("event")
             .ok_or_else(|| anyhow::anyhow!("missing event object"))?;
@@ -685,6 +972,7 @@ impl FeishuService {
         let result = client.get_user(user_id).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -705,6 +993,7 @@ impl FeishuService {
             .await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -716,6 +1005,7 @@ impl FeishuService {
         let result = client.send_text_message(chat_id, content).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -731,6 +1021,7 @@ impl FeishuService {
         let result = client.send_rich_text_message(chat_id, rich_text).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -751,6 +1042,7 @@ impl FeishuService {
             .await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -767,6 +1059,7 @@ impl FeishuService {
         let result = client.update_message(message_id, msg_type, content).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -778,6 +1071,7 @@ impl FeishuService {
         let result = client.recall_message(message_id).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -789,6 +1083,7 @@ impl FeishuService {
         let result = client.get_message(message_id).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -807,6 +1102,7 @@ impl FeishuService {
             .await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -818,6 +1114,7 @@ impl FeishuService {
         let result = client.upload_image(image_data, image_type, "message").await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -834,6 +1131,7 @@ impl FeishuService {
         let result = client.upload_file(file_name, file_data, file_type).await;
         if let Err(err) = &result {
             global_metrics().record_outbound_failure(api, &extract_error_code(err));
+            log_feishu_api_failure(api, err);
         }
         result
     }
@@ -887,8 +1185,10 @@ fn extract_text_from_post_content(content: &Value) -> String {
                                     }
                                 }
                                 "a" => {
-                                    let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                                    let href = item.get("href").and_then(Value::as_str).unwrap_or("");
+                                    let text =
+                                        item.get("text").and_then(Value::as_str).unwrap_or("");
+                                    let href =
+                                        item.get("href").and_then(Value::as_str).unwrap_or("");
                                     if text.is_empty() {
                                         parts.push(href.to_string());
                                     } else {
@@ -927,15 +1227,48 @@ fn extract_text_from_post_content(content: &Value) -> String {
 }
 
 fn extract_text_from_card_content(content: &Value) -> String {
-    let header = content
+    let mut parts = Vec::new();
+
+    if let Some(header) = content
         .pointer("/header/title/content")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    let body = content.to_string();
-    if header.is_empty() {
-        body
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(header.to_string());
+    }
+
+    if let Some(elements) = content.get("elements").and_then(Value::as_array) {
+        for element in elements {
+            if let Some(text) = element
+                .pointer("/text/content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(text.to_string());
+            }
+
+            if let Some(button_text) = element
+                .pointer("/actions/0/text/content")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+            {
+                let button_url = element
+                    .pointer("/actions/0/multi_url/default_url")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if button_url.is_empty() {
+                    parts.push(button_text.to_string());
+                } else {
+                    parts.push(format!("{} ({})", button_text, button_url));
+                }
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        content.to_string()
     } else {
-        format!("{}\n{}", header, body)
+        parts.join("\n")
     }
 }
 
@@ -953,12 +1286,27 @@ fn extract_error_code(err: &anyhow::Error) -> String {
     let message = err.to_string();
     if let Some(idx) = message.find("code=") {
         let suffix = &message[idx + 5..];
-        let code: String = suffix.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        let code: String = suffix
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect();
         if !code.is_empty() {
             return code;
         }
     }
     "unknown".to_string()
+}
+
+fn log_feishu_api_failure(api: &str, err: &anyhow::Error) {
+    let fields = parse_feishu_api_error(api, err);
+    warn!(
+        api = %fields.api,
+        code = %fields.code,
+        msg = %fields.msg,
+        retryable = fields.retryable,
+        error = %err,
+        "Feishu API call failed"
+    );
 }
 
 fn pick_first_string(root: &Value, pointers: &[&str]) -> Option<String> {

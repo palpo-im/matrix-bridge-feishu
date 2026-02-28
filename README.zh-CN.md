@@ -44,16 +44,34 @@ Provisioning 接口默认启用 Bearer 鉴权：
 
 ## 能力矩阵（当前）
 
+### 飞书消息类型（`msg_type`）
+
+| `msg_type` | 状态 | 降级策略 | 代码入口 |
+|---|---|---|---|
+| `text` | 已支持 | 纯文本直通 | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+| `post` | 已支持 | 富文本块/提及/链接展平成可读文本 | `src/feishu/service.rs:extract_text_from_post_content` |
+| `interactive` / `card` | 部分支持 | 提取标题与关键元素/按钮文本 | `src/feishu/service.rs:extract_text_from_card_content` |
+| `image` / `file` / `audio` / `media` / `sticker` | 已支持 | 走附件桥接，不可解析时降级占位文本 | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+
+### 飞书事件类型（`event_type`）
+
+| `event_type` | 状态 | 降级策略 | 代码入口 |
+|---|---|---|---|
+| `im.message.receive_v1` | 已支持 | 未知消息类型降级为文本 | `src/feishu/service.rs:handle_webhook` |
+| `im.message.recalled_v1` | 已支持 | 未命中 mapping 时记录并跳过 | `src/bridge/feishu_bridge.rs:handle_feishu_message_recalled` |
+| `im.chat.member.user.added_v1` | 已支持 | 未映射群组时记录并跳过 | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_added` |
+| `im.chat.member.user.deleted_v1` | 已支持 | 未映射群组时记录并跳过 | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_deleted` |
+| `im.chat.updated_v1` | 已支持 | 仅更新收到的增量字段 | `src/bridge/feishu_bridge.rs:handle_feishu_chat_updated` |
+| `im.chat.disbanded_v1` | 已支持 | 未命中映射时仅清理内存缓存 | `src/bridge/feishu_bridge.rs:handle_feishu_chat_disbanded` |
+
+### 桥接稳定性能力
+
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| `im.message.receive_v1` | 已支持 | 文本/富文本/图片/文件/音频/视频/卡片解析 |
-| `im.message.recalled_v1` | 已支持 | 通过 mapping 回撤 Matrix 消息 |
-| `im.chat.member.user.added_v1` | 已支持 | 同步成员加入提示与审计日志 |
-| `im.chat.member.user.deleted_v1` | 已支持 | 同步成员离开提示与审计日志 |
-| `im.chat.updated_v1` | 已支持 | 同步群信息与 thread 模式策略 |
-| `im.chat.disbanded_v1` | 已支持 | 自动清理映射并通知 Matrix |
 | Matrix 回复/编辑/撤回 | 已支持 | 对应飞书 reply/update/delete API |
 | Thread/topic 映射 | 已支持 | 维护 `thread_id/root_id/parent_id` |
+| dead-letter + 回放 | 已支持 | 失败 webhook 任务可查询并手工回放 |
+| 媒体去重缓存 | 已支持 | 基于内容哈希复用飞书资源 key |
 | PostgreSQL stores | 未支持 | 当前桥接存储仅支持 SQLite |
 
 ## 排障要点

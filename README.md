@@ -335,16 +335,34 @@ Feishu card messages are converted to Matrix messages:
 
 ## Capability Matrix
 
+### Feishu Message Types
+
+| `msg_type` | Status | Degrade Strategy | Code Entry |
+|---|---|---|---|
+| `text` | Supported | Plain text passthrough | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+| `post` | Supported | Flatten rich blocks/mentions/links into readable Matrix text | `src/feishu/service.rs:extract_text_from_post_content` |
+| `interactive` / `card` | Partial | Extract header + key elements/actions text | `src/feishu/service.rs:extract_text_from_card_content` |
+| `image` / `file` / `audio` / `media` / `sticker` | Supported | Bridge as attachments, fallback placeholder text when needed | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+
+### Feishu Event Types
+
+| `event_type` | Status | Degrade Strategy | Code Entry |
+|---|---|---|---|
+| `im.message.receive_v1` | Supported | Unknown message type falls back to text | `src/feishu/service.rs:handle_webhook` |
+| `im.message.recalled_v1` | Supported | Missing mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_message_recalled` |
+| `im.chat.member.user.added_v1` | Supported | Missing room mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_added` |
+| `im.chat.member.user.deleted_v1` | Supported | Missing room mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_deleted` |
+| `im.chat.updated_v1` | Supported | Partial field patch to existing mapping | `src/bridge/feishu_bridge.rs:handle_feishu_chat_updated` |
+| `im.chat.disbanded_v1` | Supported | Missing mapping only clears memory cache | `src/bridge/feishu_bridge.rs:handle_feishu_chat_disbanded` |
+
+### Bridge Reliability
+
 | Capability | Status | Notes |
 |---|---|---|
-| `im.message.receive_v1` | Supported | Text/post/image/file/audio/media/sticker/interactive parsing |
-| `im.message.recalled_v1` | Supported | Redacts mapped Matrix event |
-| `im.chat.member.user.added_v1` | Supported | Emits Matrix notice + audit logs |
-| `im.chat.member.user.deleted_v1` | Supported | Emits Matrix notice + audit logs |
-| `im.chat.updated_v1` | Supported | Updates mapping metadata + thread mode strategy |
-| `im.chat.disbanded_v1` | Supported | Deletes room/message mappings and notifies Matrix |
 | Matrix reply/edit/redaction | Supported | Routed to Feishu reply/update/delete APIs |
 | Thread/topic mapping | Supported | Stores and bridges `thread_id/root_id/parent_id` |
+| Dead-letter + replay | Supported | Failed webhook tasks can be listed/replayed via provisioning API |
+| Media dedupe cache | Supported | Reused Feishu uploaded key by content hash |
 | Postgres stores | Not supported | Bridge stores are SQLite-only in current build |
 
 ## Required Feishu Setup

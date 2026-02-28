@@ -12,19 +12,39 @@ pub fn format_feishu_to_matrix(message: FeishuMessage) -> BridgeMessage {
             (text_content, MessageType::RichText, vec![])
         }
         "image" => {
-            let content = "[Image]".to_string();
+            let key = message.content.image_key.unwrap_or_default();
+            let content = if key.is_empty() {
+                "[Image]".to_string()
+            } else {
+                format!("[Image:{}]", key)
+            };
             (content, MessageType::Image, vec![])
         }
         "file" => {
-            let content = "[File]".to_string();
+            let key = message.content.file_key.unwrap_or_default();
+            let content = if key.is_empty() {
+                "[File]".to_string()
+            } else {
+                format!("[File:{}]", key)
+            };
             (content, MessageType::File, vec![])
         }
         "audio" => {
-            let content = "[Audio]".to_string();
+            let key = message.content.audio_key.unwrap_or_default();
+            let content = if key.is_empty() {
+                "[Audio]".to_string()
+            } else {
+                format!("[Audio:{}]", key)
+            };
             (content, MessageType::Audio, vec![])
         }
         "video" => {
-            let content = "[Video]".to_string();
+            let key = message.content.video_key.unwrap_or_default();
+            let content = if key.is_empty() {
+                "[Video]".to_string()
+            } else {
+                format!("[Video:{}]", key)
+            };
             (content, MessageType::Video, vec![])
         }
         "card" => {
@@ -102,7 +122,17 @@ fn extract_text_from_card(card: &Option<crate::feishu::types::FeishuCard>) -> St
                 }
                 "button" => {
                     if let Some(button) = &element.button {
-                        text_parts.push(button.text.content.clone());
+                        text_parts.push(format!("{} ({})", button.text.content, button.url));
+                    }
+                }
+                "img" | "image" => {
+                    if let Some(image) = &element.image {
+                        text_parts.push(
+                            image
+                                .alt
+                                .clone()
+                                .unwrap_or_else(|| format!("[Image:{}]", image.img_key)),
+                        );
                     }
                 }
                 _ => {}

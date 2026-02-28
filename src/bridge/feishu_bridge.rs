@@ -26,7 +26,10 @@ use crate::bridge::{
 };
 use crate::config::Config;
 use crate::database::sqlite_stores::SqliteStores;
-use crate::database::{Database, EventStore, MessageMapping, MessageStore, RoomStore};
+use crate::database::{
+    Database, DeadLetterEvent, DeadLetterStore, EventStore, MediaStore, MessageMapping,
+    MessageStore, ProcessedEvent, RoomStore,
+};
 use crate::feishu::FeishuService;
 use crate::formatter;
 use crate::web::{ProvisioningApi, ScopedTimer, metrics_endpoint};
@@ -167,6 +170,7 @@ impl FeishuBridge {
         let room_store = self.stores.room_store();
         let message_store = self.stores.message_store();
         let event_store = self.stores.event_store();
+        let media_store = self.stores.media_store();
         let message_flow = Arc::new(MessageFlow::new(
             self.config.clone(),
             self.feishu_service.clone(),
@@ -178,6 +182,7 @@ impl FeishuBridge {
             room_store,
             message_store,
             event_store,
+            media_store,
             message_flow,
         ));
 
@@ -198,10 +203,13 @@ impl FeishuBridge {
         let base_router = appservice_with_handler.router();
         let provisioning_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN")
             .unwrap_or_else(|_| self.config.appservice.as_token.clone());
-        let provisioning_admin_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN")
-            .unwrap_or_else(|_| provisioning_token.clone());
+        let provisioning_admin_token =
+            std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN")
+                .unwrap_or_else(|_| provisioning_token.clone());
         let provisioning_api = ProvisioningApi::new(
             self.room_store(),
+            self.dead_letter_store(),
+            self.clone(),
             self.provisioning.clone(),
             provisioning_token,
             provisioning_admin_token,
@@ -275,6 +283,217 @@ impl FeishuBridge {
 
     pub fn message_store(&self) -> Arc<dyn MessageStore> {
         self.stores.message_store()
+    }
+
+    pub fn dead_letter_store(&self) -> Arc<dyn DeadLetterStore> {
+        self.stores.dead_letter_store()
+    }
+
+    pub fn media_store(&self) -> Arc<dyn MediaStore> {
+        self.stores.media_store()
+    }
+
+    pub async fn is_feishu_event_processed(&self, event_id: &str) -> anyhow::Result<bool> {
+        self.stores
+            .event_store()
+            .is_event_processed(&format!("feishu:{}", event_id))
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn mark_feishu_event_processed(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> anyhow::Result<()> {
+        let processed = ProcessedEvent {
+            id: 0,
+            event_id: format!("feishu:{}", event_id),
+            event_type: event_type.to_string(),
+            source: "feishu".to_string(),
+            processed_at: Utc::now(),
+        };
+        self.stores
+            .event_store()
+            .mark_event_processed(&processed)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn record_dead_letter(
+        &self,
+        event_type: &str,
+        dedupe_key: &str,
+        chat_id: Option<String>,
+        payload: Value,
+        error: &str,
+    ) -> anyhow::Result<DeadLetterEvent> {
+        let now = Utc::now();
+        let dead_letter = DeadLetterEvent {
+            id: 0,
+            source: "feishu".to_string(),
+            event_type: event_type.to_string(),
+            dedupe_key: dedupe_key.to_string(),
+            chat_id,
+            payload: payload.to_string(),
+            error: error.to_string(),
+            status: "pending".to_string(),
+            replay_count: 0,
+            last_replayed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        self.stores
+            .dead_letter_store()
+            .create_dead_letter(&dead_letter)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn list_dead_letters(
+        &self,
+        status: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> anyhow::Result<Vec<DeadLetterEvent>> {
+        self.stores
+            .dead_letter_store()
+            .list_dead_letters(status, limit, offset)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn replay_dead_letter(&self, id: i64) -> anyhow::Result<()> {
+        let Some(event) = self
+            .stores
+            .dead_letter_store()
+            .get_dead_letter_by_id(id)
+            .await?
+        else {
+            anyhow::bail!("dead-letter id={} not found", id);
+        };
+
+        if event.status.eq_ignore_ascii_case("replayed") {
+            info!(
+                dead_letter_id = id,
+                event_type = %event.event_type,
+                "Skipping replay because dead-letter is already marked replayed"
+            );
+            return Ok(());
+        }
+
+        let payload: Value = serde_json::from_str(&event.payload)
+            .map_err(|err| anyhow::anyhow!("invalid dead-letter payload json: {}", err))?;
+
+        let replay_result = self
+            .replay_dead_letter_payload(&event.event_type, &payload)
+            .await;
+        match replay_result {
+            Ok(()) => {
+                self.stores
+                    .dead_letter_store()
+                    .mark_dead_letter_replayed(event.id)
+                    .await?;
+                Ok(())
+            }
+            Err(err) => {
+                self.stores
+                    .dead_letter_store()
+                    .mark_dead_letter_failed(event.id, &err.to_string())
+                    .await?;
+                Err(err)
+            }
+        }
+    }
+
+    async fn replay_dead_letter_payload(
+        &self,
+        event_type: &str,
+        payload: &Value,
+    ) -> anyhow::Result<()> {
+        match event_type {
+            "im.message.receive_v1" | "message.receive_v1" => {
+                let message: BridgeMessage = serde_json::from_value(
+                    payload
+                        .get("message")
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("dead-letter missing message field"))?,
+                )?;
+                self.handle_feishu_message(message).await
+            }
+            "im.message.recalled_v1" => {
+                let chat_id = payload
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing chat_id"))?;
+                let message_id = payload
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing message_id"))?;
+                self.handle_feishu_message_recalled(chat_id, message_id)
+                    .await
+            }
+            "im.chat.member.user.added_v1" => {
+                let chat_id = payload
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing chat_id"))?;
+                let user_ids = payload
+                    .get("user_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing user_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                self.handle_feishu_chat_member_added(chat_id, &user_ids)
+                    .await
+            }
+            "im.chat.member.user.deleted_v1" => {
+                let chat_id = payload
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing chat_id"))?;
+                let user_ids = payload
+                    .get("user_ids")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing user_ids"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>();
+                self.handle_feishu_chat_member_deleted(chat_id, &user_ids)
+                    .await
+            }
+            "im.chat.updated_v1" => {
+                let chat_id = payload
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing chat_id"))?;
+                let chat_name = payload
+                    .get("chat_name")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let chat_mode = payload
+                    .get("chat_mode")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let chat_type = payload
+                    .get("chat_type")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                self.handle_feishu_chat_updated(chat_id, chat_name, chat_mode, chat_type)
+                    .await
+            }
+            "im.chat.disbanded_v1" => {
+                let chat_id = payload
+                    .get("chat_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("dead-letter missing chat_id"))?;
+                self.handle_feishu_chat_disbanded(chat_id).await
+            }
+            _ => anyhow::bail!("unsupported dead-letter event_type '{}'", event_type),
+        }
     }
 
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
@@ -447,7 +666,12 @@ impl FeishuBridge {
             );
         }
 
-        if let Err(err) = self.stores.message_store().delete_message_mapping(mapping.id).await {
+        if let Err(err) = self
+            .stores
+            .message_store()
+            .delete_message_mapping(mapping.id)
+            .await
+        {
             warn!(
                 "Failed to delete recalled message mapping {} (Feishu {}): {}",
                 mapping.id, feishu_message_id, err
@@ -483,7 +707,11 @@ impl FeishuBridge {
 
         if !user_ids.is_empty() {
             let notice = format!("Feishu members joined: {}", user_ids.join(", "));
-            if let Err(err) = self.bot_intent.send_notice(&mapping.matrix_room_id, &notice).await {
+            if let Err(err) = self
+                .bot_intent
+                .send_notice(&mapping.matrix_room_id, &notice)
+                .await
+            {
                 warn!(
                     "Failed to send Matrix join notice for Feishu chat {}: {}",
                     feishu_chat_id, err
@@ -520,7 +748,11 @@ impl FeishuBridge {
 
         if !user_ids.is_empty() {
             let notice = format!("Feishu members left: {}", user_ids.join(", "));
-            if let Err(err) = self.bot_intent.send_notice(&mapping.matrix_room_id, &notice).await {
+            if let Err(err) = self
+                .bot_intent
+                .send_notice(&mapping.matrix_room_id, &notice)
+                .await
+            {
                 warn!(
                     "Failed to send Matrix leave notice for Feishu chat {}: {}",
                     feishu_chat_id, err
@@ -603,7 +835,10 @@ impl FeishuBridge {
 
         if changed {
             mapping.updated_at = Utc::now();
-            self.stores.room_store().update_room_mapping(&mapping).await?;
+            self.stores
+                .room_store()
+                .update_room_mapping(&mapping)
+                .await?;
         }
 
         let mut portals = self.portals_by_mxid.write().await;
@@ -650,11 +885,11 @@ impl FeishuBridge {
         Ok(())
     }
 
-    pub async fn handle_feishu_chat_disbanded(
-        &self,
-        feishu_chat_id: &str,
-    ) -> anyhow::Result<()> {
-        info!("Handling Feishu chat disbanded event: chat={}", feishu_chat_id);
+    pub async fn handle_feishu_chat_disbanded(&self, feishu_chat_id: &str) -> anyhow::Result<()> {
+        info!(
+            "Handling Feishu chat disbanded event: chat={}",
+            feishu_chat_id
+        );
 
         let mapping = self
             .stores
@@ -702,7 +937,10 @@ impl FeishuBridge {
             .delete_room_mapping(mapping.id)
             .await?;
 
-        self.portals_by_feishu_room.write().await.remove(feishu_chat_id);
+        self.portals_by_feishu_room
+            .write()
+            .await
+            .remove(feishu_chat_id);
         self.portals_by_mxid
             .write()
             .await
@@ -1026,16 +1264,16 @@ impl FeishuBridge {
         let (kind, key) = parse_feishu_attachment_url(&attachment.url)
             .ok_or_else(|| anyhow::anyhow!("invalid feishu attachment url: {}", attachment.url))?;
 
-        let resource_type = feishu_resource_type_for_kind(kind).ok_or_else(|| {
-            anyhow::anyhow!("unsupported feishu attachment kind '{}'", kind)
-        })?;
+        let resource_type = feishu_resource_type_for_kind(kind)
+            .ok_or_else(|| anyhow::anyhow!("unsupported feishu attachment kind '{}'", kind))?;
 
         let bytes = self
             .feishu_service
             .get_message_resource(feishu_message_id, key, resource_type)
             .await?;
 
-        if self.config.bridge.max_media_size > 0 && bytes.len() > self.config.bridge.max_media_size {
+        if self.config.bridge.max_media_size > 0 && bytes.len() > self.config.bridge.max_media_size
+        {
             anyhow::bail!(
                 "feishu attachment exceeds configured max_media_size: {} > {}",
                 bytes.len(),

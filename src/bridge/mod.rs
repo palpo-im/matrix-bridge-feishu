@@ -1,6 +1,8 @@
 pub mod command_handler;
 pub mod event_processor;
 pub mod feishu_bridge;
+pub mod matrix_event_parser;
+pub mod matrix_to_feishu_dispatcher;
 pub mod message;
 pub mod message_flow;
 pub mod portal;

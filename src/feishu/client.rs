@@ -698,7 +698,9 @@ fn classify_http_error(status: u16) -> FeishuErrorClass {
 fn classify_api_error(code: i64, msg: &str) -> FeishuErrorClass {
     let normalized = msg.to_ascii_lowercase();
 
-    if matches!(code, 99991663 | 90013) || normalized.contains("rate") || normalized.contains("frequency")
+    if matches!(code, 99991663 | 90013)
+        || normalized.contains("rate")
+        || normalized.contains("frequency")
     {
         return FeishuErrorClass::RateLimited;
     }
@@ -789,6 +791,9 @@ mod tests {
             classify_api_error(1, "permission denied").as_str(),
             "permission_denied"
         );
-        assert_eq!(classify_api_error(1, "invalid param").as_str(), "invalid_request");
+        assert_eq!(
+            classify_api_error(1, "invalid param").as_str(),
+            "invalid_request"
+        );
     }
 }

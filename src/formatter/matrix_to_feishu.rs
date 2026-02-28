@@ -70,21 +70,43 @@ pub fn convert_matrix_markdown_to_feishu(content: &str) -> String {
 }
 
 pub fn create_feishu_rich_text(content: &str) -> String {
-    // Create rich text content for Feishu
-    let rich_text = FeishuRichText {
-        title: None,
-        content: vec![crate::feishu::types::FeishuRichTextElement {
-            segment_type: "text".to_string(),
-            content: crate::feishu::types::FeishuRichTextContent {
-                text: Some(content.to_string()),
-                link: None,
-                mention: None,
-                image: None,
-            },
-        }],
-    };
+    // Feishu `post` payload with lightweight mention/link extraction.
+    let mut row = Vec::new();
+    for token in content.split_whitespace() {
+        if token.starts_with('@') && token.len() > 1 {
+            row.push(json!({
+                "tag": "at",
+                "user_name": token.trim_start_matches('@')
+            }));
+            row.push(json!({ "tag": "text", "text": " " }));
+            continue;
+        }
 
-    serde_json::to_string(&rich_text).unwrap_or_default()
+        if token.starts_with("http://") || token.starts_with("https://") {
+            row.push(json!({
+                "tag": "a",
+                "text": token,
+                "href": token
+            }));
+            row.push(json!({ "tag": "text", "text": " " }));
+            continue;
+        }
+
+        row.push(json!({ "tag": "text", "text": token }));
+        row.push(json!({ "tag": "text", "text": " " }));
+    }
+
+    if row.is_empty() {
+        row.push(json!({ "tag": "text", "text": content }));
+    }
+
+    json!({
+        "zh_cn": {
+            "title": "",
+            "content": [row]
+        }
+    })
+    .to_string()
 }
 
 pub fn extract_matrix_mentions(content: &str) -> String {

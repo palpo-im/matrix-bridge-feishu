@@ -10,8 +10,10 @@ use diesel::{
 use parking_lot::Mutex;
 
 use super::error::{DatabaseError, DatabaseResult};
-use super::models::{MessageMapping, ProcessedEvent, RoomMapping, UserMapping};
-use super::stores::{EventStore, MessageStore, RoomStore, UserStore};
+use super::models::{
+    DeadLetterEvent, MediaCacheEntry, MessageMapping, ProcessedEvent, RoomMapping, UserMapping,
+};
+use super::stores::{DeadLetterStore, EventStore, MediaStore, MessageStore, RoomStore, UserStore};
 
 type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -65,6 +67,34 @@ table! {
     }
 }
 
+table! {
+    dead_letters (id) {
+        id -> BigInt,
+        source -> Text,
+        event_type -> Text,
+        dedupe_key -> Text,
+        chat_id -> Nullable<Text>,
+        payload -> Text,
+        error -> Text,
+        status -> Text,
+        replay_count -> BigInt,
+        last_replayed_at -> Nullable<Text>,
+        created_at -> Text,
+        updated_at -> Text,
+    }
+}
+
+table! {
+    media_cache (id) {
+        id -> BigInt,
+        content_hash -> Text,
+        media_kind -> Text,
+        resource_key -> Text,
+        created_at -> Text,
+        updated_at -> Text,
+    }
+}
+
 #[derive(Clone)]
 pub struct SqliteStores {
     pool: SqlitePool,
@@ -98,6 +128,14 @@ impl SqliteStores {
     }
 
     pub fn event_store(&self) -> Arc<dyn EventStore> {
+        Arc::new(self.clone())
+    }
+
+    pub fn dead_letter_store(&self) -> Arc<dyn DeadLetterStore> {
+        Arc::new(self.clone())
+    }
+
+    pub fn media_store(&self) -> Arc<dyn MediaStore> {
         Arc::new(self.clone())
     }
 }
@@ -431,6 +469,25 @@ impl MessageStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
+    async fn get_message_by_content_hash(
+        &self,
+        content_hash: &str,
+    ) -> DatabaseResult<Option<MessageMapping>> {
+        let pool = self.pool.clone();
+        let hash = content_hash.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let msg: Option<SqliteMessageMapping> = message_mappings::table
+                .filter(message_mappings::content_hash.eq(&hash))
+                .first(&mut conn)
+                .optional()
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(msg.map(|m| m.into_model()))
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
     async fn delete_message_mapping(&self, id: i64) -> DatabaseResult<()> {
         let pool = self.pool.clone();
         tokio::task::spawn_blocking(move || {
@@ -512,6 +569,177 @@ impl EventStore for SqliteStores {
             .execute(&mut conn)
             .map_err(DatabaseError::from)?;
             Ok::<_, DatabaseError>(count as u64)
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+}
+
+#[async_trait]
+impl DeadLetterStore for SqliteStores {
+    async fn create_dead_letter(&self, event: &DeadLetterEvent) -> DatabaseResult<DeadLetterEvent> {
+        let pool = self.pool.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let new_event = NewSqliteDeadLetter::from_model(&event);
+            diesel::insert_into(dead_letters::table)
+                .values(&new_event)
+                .on_conflict(dead_letters::dedupe_key)
+                .do_update()
+                .set((
+                    dead_letters::error.eq(new_event.error.clone()),
+                    dead_letters::payload.eq(new_event.payload.clone()),
+                    dead_letters::status.eq("pending"),
+                    dead_letters::updated_at.eq(new_event.updated_at.clone()),
+                ))
+                .execute(&mut conn)
+                .map_err(DatabaseError::from)?;
+
+            let saved: SqliteDeadLetter = dead_letters::table
+                .filter(dead_letters::dedupe_key.eq(&event.dedupe_key))
+                .first(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(saved.into_model())
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn list_dead_letters(
+        &self,
+        status: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> DatabaseResult<Vec<DeadLetterEvent>> {
+        let pool = self.pool.clone();
+        let status = status.map(ToOwned::to_owned);
+        let limit = limit.unwrap_or(100);
+        let offset = offset.unwrap_or(0);
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let mut query = dead_letters::table.into_boxed();
+            if let Some(status) = status {
+                query = query.filter(dead_letters::status.eq(status));
+            }
+
+            let rows: Vec<SqliteDeadLetter> = query
+                .order(dead_letters::id.desc())
+                .limit(limit)
+                .offset(offset)
+                .load(&mut conn)
+                .map_err(DatabaseError::from)?;
+
+            Ok::<_, DatabaseError>(rows.into_iter().map(|row| row.into_model()).collect())
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn get_dead_letter_by_id(&self, id: i64) -> DatabaseResult<Option<DeadLetterEvent>> {
+        let pool = self.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let row: Option<SqliteDeadLetter> = dead_letters::table
+                .filter(dead_letters::id.eq(id))
+                .first(&mut conn)
+                .optional()
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(row.map(|item| item.into_model()))
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn mark_dead_letter_replayed(&self, id: i64) -> DatabaseResult<()> {
+        let pool = self.pool.clone();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            diesel::update(dead_letters::table.filter(dead_letters::id.eq(id)))
+                .set((
+                    dead_letters::status.eq("replayed"),
+                    dead_letters::replay_count.eq(dead_letters::replay_count + 1),
+                    dead_letters::last_replayed_at.eq(Some(now.clone())),
+                    dead_letters::updated_at.eq(now.clone()),
+                ))
+                .execute(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(())
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn mark_dead_letter_failed(&self, id: i64, error: &str) -> DatabaseResult<()> {
+        let pool = self.pool.clone();
+        let error = error.to_string();
+        let now = Utc::now().to_rfc3339();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            diesel::update(dead_letters::table.filter(dead_letters::id.eq(id)))
+                .set((
+                    dead_letters::status.eq("failed"),
+                    dead_letters::error.eq(error),
+                    dead_letters::updated_at.eq(now),
+                ))
+                .execute(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(())
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+}
+
+#[async_trait]
+impl MediaStore for SqliteStores {
+    async fn get_media_cache(
+        &self,
+        content_hash: &str,
+        media_kind: &str,
+    ) -> DatabaseResult<Option<MediaCacheEntry>> {
+        let pool = self.pool.clone();
+        let hash = content_hash.to_string();
+        let kind = media_kind.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let row: Option<SqliteMediaCache> = media_cache::table
+                .filter(media_cache::content_hash.eq(hash))
+                .filter(media_cache::media_kind.eq(kind))
+                .first(&mut conn)
+                .optional()
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(row.map(|entry| entry.into_model()))
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn upsert_media_cache(&self, entry: &MediaCacheEntry) -> DatabaseResult<MediaCacheEntry> {
+        let pool = self.pool.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let row = NewSqliteMediaCache::from_model(&entry);
+            diesel::insert_into(media_cache::table)
+                .values(&row)
+                .on_conflict((media_cache::content_hash, media_cache::media_kind))
+                .do_update()
+                .set((
+                    media_cache::resource_key.eq(row.resource_key.clone()),
+                    media_cache::updated_at.eq(row.updated_at.clone()),
+                ))
+                .execute(&mut conn)
+                .map_err(DatabaseError::from)?;
+
+            let saved: SqliteMediaCache = media_cache::table
+                .filter(media_cache::content_hash.eq(&entry.content_hash))
+                .filter(media_cache::media_kind.eq(&entry.media_kind))
+                .first(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(saved.into_model())
         })
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?
@@ -737,8 +965,7 @@ struct NewSqliteProcessedEvent {
     processed_at: String,
 }
 
-impl SqliteProcessedEvent {
-}
+impl SqliteProcessedEvent {}
 
 impl NewSqliteProcessedEvent {
     fn from_model(model: &ProcessedEvent) -> Self {
@@ -747,6 +974,133 @@ impl NewSqliteProcessedEvent {
             event_type: model.event_type.clone(),
             source: model.source.clone(),
             processed_at: model.processed_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Queryable, Insertable, AsChangeset)]
+#[diesel(table_name = dead_letters)]
+struct SqliteDeadLetter {
+    id: i64,
+    source: String,
+    event_type: String,
+    dedupe_key: String,
+    chat_id: Option<String>,
+    payload: String,
+    error: String,
+    status: String,
+    replay_count: i64,
+    last_replayed_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = dead_letters)]
+struct NewSqliteDeadLetter {
+    source: String,
+    event_type: String,
+    dedupe_key: String,
+    chat_id: Option<String>,
+    payload: String,
+    error: String,
+    status: String,
+    replay_count: i64,
+    last_replayed_at: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl SqliteDeadLetter {
+    fn into_model(self) -> DeadLetterEvent {
+        DeadLetterEvent {
+            id: self.id,
+            source: self.source,
+            event_type: self.event_type,
+            dedupe_key: self.dedupe_key,
+            chat_id: self.chat_id,
+            payload: self.payload,
+            error: self.error,
+            status: self.status,
+            replay_count: self.replay_count,
+            last_replayed_at: self
+                .last_replayed_at
+                .and_then(|value| DateTime::parse_from_rfc3339(&value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+            created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: DateTime::parse_from_rfc3339(&self.updated_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+impl NewSqliteDeadLetter {
+    fn from_model(model: &DeadLetterEvent) -> Self {
+        Self {
+            source: model.source.clone(),
+            event_type: model.event_type.clone(),
+            dedupe_key: model.dedupe_key.clone(),
+            chat_id: model.chat_id.clone(),
+            payload: model.payload.clone(),
+            error: model.error.clone(),
+            status: model.status.clone(),
+            replay_count: model.replay_count,
+            last_replayed_at: model.last_replayed_at.map(|value| value.to_rfc3339()),
+            created_at: model.created_at.to_rfc3339(),
+            updated_at: model.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Queryable, Insertable, AsChangeset)]
+#[diesel(table_name = media_cache)]
+struct SqliteMediaCache {
+    id: i64,
+    content_hash: String,
+    media_kind: String,
+    resource_key: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = media_cache)]
+struct NewSqliteMediaCache {
+    content_hash: String,
+    media_kind: String,
+    resource_key: String,
+    created_at: String,
+    updated_at: String,
+}
+
+impl SqliteMediaCache {
+    fn into_model(self) -> MediaCacheEntry {
+        MediaCacheEntry {
+            id: self.id,
+            content_hash: self.content_hash,
+            media_kind: self.media_kind,
+            resource_key: self.resource_key,
+            created_at: DateTime::parse_from_rfc3339(&self.created_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+            updated_at: DateTime::parse_from_rfc3339(&self.updated_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now()),
+        }
+    }
+}
+
+impl NewSqliteMediaCache {
+    fn from_model(model: &MediaCacheEntry) -> Self {
+        Self {
+            content_hash: model.content_hash.clone(),
+            media_kind: model.media_kind.clone(),
+            resource_key: model.resource_key.clone(),
+            created_at: model.created_at.to_rfc3339(),
+            updated_at: model.updated_at.to_rfc3339(),
         }
     }
 }

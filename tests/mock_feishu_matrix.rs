@@ -50,8 +50,11 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         media_download_calls: Arc::new(AtomicU64::new(0)),
     };
     let (matrix_base, _matrix_handle) = start_matrix_mock(matrix_state.clone()).await;
-    wait_for_http_ready(&format!("{}/open-apis/auth/v3/tenant_access_token/internal", feishu_base))
-        .await;
+    wait_for_http_ready(&format!(
+        "{}/open-apis/auth/v3/tenant_access_token/internal",
+        feishu_base
+    ))
+    .await;
     wait_for_http_ready(&format!("{}/media/cat.png", matrix_base)).await;
 
     let db_path = std::env::temp_dir().join(format!("matrix-bridge-test-{}.db", Uuid::new_v4()));
@@ -60,7 +63,9 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
     let db = Database::connect("sqlite", &db_uri, 4, 1)
         .await
         .expect("db connect should succeed");
-    db.run_migrations().await.expect("migrations should succeed");
+    db.run_migrations()
+        .await
+        .expect("migrations should succeed");
 
     let manager = ConnectionManager::<SqliteConnection>::new(db_path.to_string_lossy().to_string());
     let pool = Pool::builder()
@@ -105,6 +110,7 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         stores.room_store(),
         stores.message_store(),
         stores.event_store(),
+        stores.media_store(),
         message_flow,
     );
 
@@ -121,8 +127,9 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         })),
         timestamp: None,
     };
-    let parsed = MessageFlow::parse_matrix_event("m.room.message", event.content.as_ref().expect("content"))
-        .expect("matrix event should parse into outbound payload");
+    let parsed =
+        MessageFlow::parse_matrix_event("m.room.message", event.content.as_ref().expect("content"))
+            .expect("matrix event should parse into outbound payload");
     assert_eq!(
         parsed.attachments.len(),
         1,
@@ -157,7 +164,10 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         .get_message_by_matrix_id("$evt1")
         .await
         .expect("query should succeed");
-    assert!(mapping_after_create.is_some(), "mapping should exist after create");
+    assert!(
+        mapping_after_create.is_some(),
+        "mapping should exist after create"
+    );
     assert!(
         feishu_state.create_calls.load(Ordering::Relaxed) >= 1,
         "expected at least one Feishu create call"

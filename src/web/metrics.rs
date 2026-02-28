@@ -48,7 +48,10 @@ impl BridgeMetrics {
     }
 
     pub fn record_processing_duration(&self, stage: &str, duration: Duration) {
-        let mut guard = self.processing_stats.lock().expect("metrics mutex poisoned");
+        let mut guard = self
+            .processing_stats
+            .lock()
+            .expect("metrics mutex poisoned");
         let entry = guard.entry(stage.to_string()).or_default();
         entry.count = entry.count.saturating_add(1);
         entry.sum_ms = entry
@@ -74,9 +77,11 @@ impl BridgeMetrics {
     }
 
     fn end_queue_task(&self) {
-        let _ = self.queue_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-            Some(value.saturating_sub(1))
-        });
+        let _ = self
+            .queue_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            });
     }
 
     pub fn render_prometheus(&self) -> String {
@@ -215,7 +220,9 @@ fn sorted_pairs(map: &Mutex<HashMap<String, u64>>) -> Vec<(String, u64)> {
     values
 }
 
-fn sorted_processing(map: &Mutex<HashMap<String, ProcessingStats>>) -> Vec<(String, ProcessingStats)> {
+fn sorted_processing(
+    map: &Mutex<HashMap<String, ProcessingStats>>,
+) -> Vec<(String, ProcessingStats)> {
     let guard = map.lock().expect("metrics mutex poisoned");
     let mut values: Vec<(String, ProcessingStats)> =
         guard.iter().map(|(k, v)| (k.clone(), *v)).collect();

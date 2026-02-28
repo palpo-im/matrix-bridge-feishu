@@ -47,6 +47,32 @@ pub struct ProcessedEvent {
     pub processed_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeadLetterEvent {
+    pub id: i64,
+    pub source: String,
+    pub event_type: String,
+    pub dedupe_key: String,
+    pub chat_id: Option<String>,
+    pub payload: String,
+    pub error: String,
+    pub status: String,
+    pub replay_count: i64,
+    pub last_replayed_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaCacheEntry {
+    pub id: i64,
+    pub content_hash: String,
+    pub media_kind: String,
+    pub resource_key: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 impl RoomMapping {
     pub fn new(
         matrix_room_id: String,
@@ -117,6 +143,11 @@ impl MessageMapping {
         self.thread_id = thread_id;
         self.root_id = root_id;
         self.parent_id = parent_id;
+        self
+    }
+
+    pub fn with_content_hash(mut self, content_hash: Option<String>) -> Self {
+        self.content_hash = content_hash;
         self
     }
 }

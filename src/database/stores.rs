@@ -4,7 +4,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use super::error::DatabaseResult;
-use super::models::{MessageMapping, ProcessedEvent, RoomMapping, UserMapping};
+use super::models::{
+    DeadLetterEvent, MediaCacheEntry, MessageMapping, ProcessedEvent, RoomMapping, UserMapping,
+};
 
 #[async_trait]
 pub trait RoomStore: Send + Sync {
@@ -61,6 +63,10 @@ pub trait MessageStore: Send + Sync {
         &self,
         mapping: &MessageMapping,
     ) -> DatabaseResult<MessageMapping>;
+    async fn get_message_by_content_hash(
+        &self,
+        content_hash: &str,
+    ) -> DatabaseResult<Option<MessageMapping>>;
     async fn delete_message_mapping(&self, id: i64) -> DatabaseResult<()>;
     async fn get_messages_by_room(
         &self,
@@ -76,7 +82,33 @@ pub trait EventStore: Send + Sync {
     async fn cleanup_old_events(&self, before: DateTime<Utc>) -> DatabaseResult<u64>;
 }
 
+#[async_trait]
+pub trait DeadLetterStore: Send + Sync {
+    async fn create_dead_letter(&self, event: &DeadLetterEvent) -> DatabaseResult<DeadLetterEvent>;
+    async fn list_dead_letters(
+        &self,
+        status: Option<&str>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> DatabaseResult<Vec<DeadLetterEvent>>;
+    async fn get_dead_letter_by_id(&self, id: i64) -> DatabaseResult<Option<DeadLetterEvent>>;
+    async fn mark_dead_letter_replayed(&self, id: i64) -> DatabaseResult<()>;
+    async fn mark_dead_letter_failed(&self, id: i64, error: &str) -> DatabaseResult<()>;
+}
+
+#[async_trait]
+pub trait MediaStore: Send + Sync {
+    async fn get_media_cache(
+        &self,
+        content_hash: &str,
+        media_kind: &str,
+    ) -> DatabaseResult<Option<MediaCacheEntry>>;
+    async fn upsert_media_cache(&self, entry: &MediaCacheEntry) -> DatabaseResult<MediaCacheEntry>;
+}
+
 pub type SharedRoomStore = Arc<dyn RoomStore>;
 pub type SharedUserStore = Arc<dyn UserStore>;
 pub type SharedMessageStore = Arc<dyn MessageStore>;
 pub type SharedEventStore = Arc<dyn EventStore>;
+pub type SharedDeadLetterStore = Arc<dyn DeadLetterStore>;
+pub type SharedMediaStore = Arc<dyn MediaStore>;

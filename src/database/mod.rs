@@ -4,8 +4,10 @@ pub mod sqlite_stores;
 pub mod stores;
 
 pub use error::{DatabaseError, DatabaseResult};
-pub use models::{MessageMapping, ProcessedEvent, RoomMapping, UserMapping};
-pub use stores::{EventStore, MessageStore, RoomStore, UserStore};
+pub use models::{
+    DeadLetterEvent, MediaCacheEntry, MessageMapping, ProcessedEvent, RoomMapping, UserMapping,
+};
+pub use stores::{DeadLetterStore, EventStore, MediaStore, MessageStore, RoomStore, UserStore};
 
 use std::path::{Path, PathBuf};
 
@@ -257,6 +259,31 @@ CREATE TABLE IF NOT EXISTS processed_events (
     processed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    chat_id TEXT,
+    payload TEXT NOT NULL,
+    error TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    replay_count INTEGER NOT NULL DEFAULT 0,
+    last_replayed_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS media_cache (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash TEXT NOT NULL,
+    media_kind TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(content_hash, media_kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_room_mappings_matrix_id ON room_mappings(matrix_room_id);
 CREATE INDEX IF NOT EXISTS idx_room_mappings_feishu_id ON room_mappings(feishu_chat_id);
 CREATE INDEX IF NOT EXISTS idx_user_mappings_matrix_id ON user_mappings(matrix_user_id);
@@ -264,7 +291,12 @@ CREATE INDEX IF NOT EXISTS idx_user_mappings_feishu_id ON user_mappings(feishu_u
 CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(matrix_event_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_content_hash
+    ON message_mappings(content_hash);
 CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_status ON dead_letters(status);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_created_at ON dead_letters(created_at);
+CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache(created_at);
 "#;
 
 const POSTGRES_MIGRATIONS: &str = r#"
@@ -368,6 +400,31 @@ CREATE TABLE IF NOT EXISTS processed_events (
     processed_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS dead_letters (
+    id BIGSERIAL PRIMARY KEY,
+    source TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    chat_id TEXT,
+    payload TEXT NOT NULL,
+    error TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    replay_count BIGINT NOT NULL DEFAULT 0,
+    last_replayed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS media_cache (
+    id BIGSERIAL PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    media_kind TEXT NOT NULL,
+    resource_key TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    UNIQUE(content_hash, media_kind)
+);
+
 CREATE INDEX IF NOT EXISTS idx_room_mappings_matrix_id ON room_mappings(matrix_room_id);
 CREATE INDEX IF NOT EXISTS idx_room_mappings_feishu_id ON room_mappings(feishu_chat_id);
 CREATE INDEX IF NOT EXISTS idx_user_mappings_matrix_id ON user_mappings(matrix_user_id);
@@ -375,14 +432,20 @@ CREATE INDEX IF NOT EXISTS idx_user_mappings_feishu_id ON user_mappings(feishu_u
 CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(matrix_event_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
+CREATE INDEX IF NOT EXISTS idx_message_mappings_content_hash
+    ON message_mappings(content_hash);
 CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_status ON dead_letters(status);
+CREATE INDEX IF NOT EXISTS idx_dead_letters_created_at ON dead_letters(created_at);
+CREATE INDEX IF NOT EXISTS idx_media_cache_created_at ON media_cache(created_at);
 ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS thread_id TEXT;
 ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS root_id TEXT;
 ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS parent_id TEXT;
+ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS content_hash TEXT;
 "#;
 
 fn ensure_sqlite_message_mapping_columns(conn: &mut SqliteConnection) -> Result<()> {
-    for column in ["thread_id", "root_id", "parent_id"] {
+    for column in ["thread_id", "root_id", "parent_id", "content_hash"] {
         let statement = format!("ALTER TABLE message_mappings ADD COLUMN {} TEXT", column);
         if let Err(err) = conn.batch_execute(&statement) {
             let message = err.to_string().to_ascii_lowercase();

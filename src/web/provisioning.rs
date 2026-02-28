@@ -6,12 +6,14 @@ use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::bridge::{PendingBridgeRequest, ProvisioningCoordinator};
-use crate::database::RoomStore;
+use crate::bridge::{FeishuBridge, PendingBridgeRequest, ProvisioningCoordinator};
+use crate::database::{DeadLetterStore, RoomStore};
 
 #[derive(Clone)]
 pub struct ProvisioningApi {
     room_store: Arc<dyn RoomStore>,
+    dead_letter_store: Arc<dyn DeadLetterStore>,
+    bridge: FeishuBridge,
     provisioning: Arc<ProvisioningCoordinator>,
     token: String,
     admin_token: String,
@@ -20,12 +22,16 @@ pub struct ProvisioningApi {
 impl ProvisioningApi {
     pub fn new(
         room_store: Arc<dyn RoomStore>,
+        dead_letter_store: Arc<dyn DeadLetterStore>,
+        bridge: FeishuBridge,
         provisioning: Arc<ProvisioningCoordinator>,
         token: String,
         admin_token: String,
     ) -> Self {
         Self {
             room_store,
+            dead_letter_store,
+            bridge,
             provisioning,
             token,
             admin_token,
@@ -43,6 +49,8 @@ impl ProvisioningApi {
             )
             .push(Router::with_path("bridges/<room_id>").delete(delete_bridge))
             .push(Router::with_path("pending").get(list_pending))
+            .push(Router::with_path("dead-letters").get(list_dead_letters))
+            .push(Router::with_path("dead-letters/<id>/replay").post(replay_dead_letter))
             .hoop(affix_state::inject(self))
     }
 }
@@ -239,6 +247,87 @@ async fn list_pending(req: &mut Request, depot: &mut Depot, res: &mut Response) 
 
     let count = pending.len();
     res.render(Json(PendingResponse { pending, count }));
+}
+
+#[derive(Debug, Serialize)]
+struct DeadLetterListResponse {
+    dead_letters: Vec<crate::database::DeadLetterEvent>,
+    count: usize,
+}
+
+#[handler]
+async fn list_dead_letters(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, false, res) else {
+        return;
+    };
+
+    let status = req.query::<String>("status");
+    let limit = req.query::<i64>("limit");
+    let offset = req.query::<i64>("offset");
+    info!(
+        action = "list_dead_letters",
+        actor = %actor,
+        status = ?status,
+        limit = ?limit,
+        offset = ?offset,
+        "Provisioning list dead letters"
+    );
+
+    match api
+        .dead_letter_store
+        .list_dead_letters(status.as_deref(), limit, offset)
+        .await
+    {
+        Ok(dead_letters) => {
+            let count = dead_letters.len();
+            res.render(Json(DeadLetterListResponse {
+                dead_letters,
+                count,
+            }));
+        }
+        Err(err) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "success": false,
+                "message": err.to_string()
+            })));
+        }
+    }
+}
+
+#[handler]
+async fn replay_dead_letter(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, true, res) else {
+        return;
+    };
+
+    let id = req.param::<i64>("id").unwrap_or_default();
+    info!(
+        action = "replay_dead_letter",
+        actor = %actor,
+        dead_letter_id = id,
+        "Provisioning replay dead letter requested"
+    );
+
+    match api.bridge.replay_dead_letter(id).await {
+        Ok(()) => {
+            res.render(Json(serde_json::json!({
+                "success": true,
+                "message": "dead-letter replayed",
+                "id": id
+            })));
+        }
+        Err(err) => {
+            res.status_code(StatusCode::BAD_REQUEST);
+            res.render(Json(serde_json::json!({
+                "success": false,
+                "message": err.to_string(),
+                "id": id
+            })));
+        }
+    }
 }
 
 fn require_auth(

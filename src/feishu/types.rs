@@ -312,3 +312,78 @@ pub struct FeishuImageUploadData {
 pub struct FeishuFileUploadData {
     pub file_key: String,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CapabilityStatus {
+    Supported,
+    Partial,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct FeishuCapabilityMatrixRow {
+    pub capability: &'static str,
+    pub status: CapabilityStatus,
+    pub degrade_strategy: &'static str,
+    pub code_entry: &'static str,
+}
+
+pub const FEISHU_MESSAGE_CAPABILITIES: &[FeishuCapabilityMatrixRow] = &[
+    FeishuCapabilityMatrixRow {
+        capability: "text",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "fallback to plain text",
+        code_entry: "src/feishu/service.rs:webhook_event_to_bridge_message",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "post",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "flatten post blocks to readable text",
+        code_entry: "src/feishu/service.rs:extract_text_from_post_content",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "interactive/card",
+        status: CapabilityStatus::Partial,
+        degrade_strategy: "extract key header/actions text when unsupported",
+        code_entry: "src/feishu/service.rs:extract_text_from_card_content",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "image/file/audio/media/sticker",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "bridge as Matrix attachment or placeholder text",
+        code_entry: "src/feishu/service.rs:webhook_event_to_bridge_message",
+    },
+];
+
+pub const FEISHU_EVENT_CAPABILITIES: &[FeishuCapabilityMatrixRow] = &[
+    FeishuCapabilityMatrixRow {
+        capability: "im.message.receive_v1",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "unknown msg_type falls back to text",
+        code_entry: "src/feishu/service.rs:handle_webhook",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "im.message.recalled_v1",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "missing mapping logs and skips",
+        code_entry: "src/bridge/feishu_bridge.rs:handle_feishu_message_recalled",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "im.chat.member.user.added_v1 / deleted_v1",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "no room mapping then skip with debug log",
+        code_entry: "src/bridge/feishu_bridge.rs:handle_feishu_chat_member_added",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "im.chat.updated_v1",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "partial fields are merged into existing mapping",
+        code_entry: "src/bridge/feishu_bridge.rs:handle_feishu_chat_updated",
+    },
+    FeishuCapabilityMatrixRow {
+        capability: "im.chat.disbanded_v1",
+        status: CapabilityStatus::Supported,
+        degrade_strategy: "missing mapping clears in-memory cache only",
+        code_entry: "src/bridge/feishu_bridge.rs:handle_feishu_chat_disbanded",
+    },
+];
