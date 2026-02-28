@@ -105,6 +105,34 @@ cargo run -- -c config.yaml dead-letter-cleanup --status replayed --older-than-h
 - 策略阻断/降级：查看 `/metrics` 中 `bridge_policy_blocked_total_by_reason` 与 `bridge_degraded_events_total_by_reason`。
 - 链路追踪：查看 `bridge_trace_events_total_by_flow_status`，并用日志字段 `trace_id` 关联 `matrix_event_id` / `feishu_message_id`。
 
+## 压测与容量边界
+
+使用内置脚本评估 webhook 并发与批量突发消息稳定性：
+
+```powershell
+pwsh ./scripts/stress-webhook.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+
+pwsh ./scripts/stress-batch-messages.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+```
+
+脚本默认容量边界判定标准：
+- `error_rate <= 1%`
+- `p95 延迟 <= 1500ms`
+- `bridge_queue_depth_max` 不应持续失控增长（并发模式下 `delta <= concurrency*2`）
+
+推荐生产初始参数（以脚本输出为准再微调）：
+- 并发：取稳定上限的 `70%`
+- 重试：`FEISHU_API_MAX_RETRIES=2`，`FEISHU_API_RETRY_BASE_MS=250`（接近边界时可升到 `500`）
+- 超时：`bridge.webhook_timeout = max(30s, ceil(p99*3))`，`bridge.api_timeout = max(60s, ceil(p99*4))`
+
 ## 发布前自检脚本
 
 ```powershell

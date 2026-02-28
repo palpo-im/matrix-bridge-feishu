@@ -285,6 +285,34 @@ RUST_LOG=debug ./matrix-appservice-feishu -c config.yaml
 RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
 ```
 
+### Stress Testing
+
+Use built-in scripts to evaluate webhook burst handling and queue stability:
+
+```powershell
+pwsh ./scripts/stress-webhook.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+
+pwsh ./scripts/stress-batch-messages.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+```
+
+Capacity boundary rule used by both scripts:
+- `error_rate <= 1%`
+- `p95 latency <= 1500ms`
+- `bridge_queue_depth_max` should not grow faster than load (`delta <= concurrency*2` in webhook ramp mode)
+
+Recommended starting production parameters (adjust from script output):
+- Concurrency: `70%` of measured stable max concurrency
+- Retry: `FEISHU_API_MAX_RETRIES=2`, `FEISHU_API_RETRY_BASE_MS=250` (raise base delay to `500ms` near boundary)
+- Timeout: `bridge.webhook_timeout = max(30s, ceil(p99*3))`, `bridge.api_timeout = max(60s, ceil(p99*4))`
+
 ## Troubleshooting
 
 ### Common Issues
