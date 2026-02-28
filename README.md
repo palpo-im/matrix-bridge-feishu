@@ -41,13 +41,13 @@ The bridge is built with a modular architecture:
 1. **Clone and build:**
    ```bash
    git clone <repository-url>
-   cd matrix-appservice-feishu
+   cd matrix-bridge-feishu
    cargo build --release
    ```
 
 2. **Generate configuration:**
    ```bash
-   ./target/release/matrix-appservice-feishu --generate-config > config.yaml
+   ./target/release/matrix-bridge-feishu --generate-config > config.yaml
    ```
 
 3. **Configure your bridge:**
@@ -75,7 +75,7 @@ The bridge is built with a modular architecture:
 
 5. **Start the bridge:**
    ```bash
-   ./target/release/matrix-appservice-feishu -c config.yaml
+   ./target/release/matrix-bridge-feishu -c config.yaml
    ```
 
 ## Configuration
@@ -156,11 +156,11 @@ Authorization: Bearer <token>
 ### Ops CLI Commands
 
 ```bash
-./target/release/matrix-appservice-feishu -c config.yaml status
-./target/release/matrix-appservice-feishu -c config.yaml mappings --limit 50 --offset 0
-./target/release/matrix-appservice-feishu -c config.yaml replay --id 123
-./target/release/matrix-appservice-feishu -c config.yaml replay --status pending --limit 20
-./target/release/matrix-appservice-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
+./target/release/matrix-bridge-feishu -c config.yaml status
+./target/release/matrix-bridge-feishu -c config.yaml mappings --limit 50 --offset 0
+./target/release/matrix-bridge-feishu -c config.yaml replay --id 123
+./target/release/matrix-bridge-feishu -c config.yaml replay --status pending --limit 20
+./target/release/matrix-bridge-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
 ```
 
 Use `--admin-api http://host:port/admin` and `--token <provisioning_token>` to target remote instances.
@@ -226,9 +226,9 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
-COPY --from=builder /app/target/release/matrix-appservice-feishu /usr/local/bin/
+COPY --from=builder /app/target/release/matrix-bridge-feishu /usr/local/bin/
 EXPOSE 8080 8081
-CMD ["matrix-appservice-feishu", "-c", "/config/config.yaml"]
+CMD ["matrix-bridge-feishu", "-c", "/config/config.yaml"]
 ```
 
 ### Docker Compose
@@ -236,7 +236,7 @@ CMD ["matrix-appservice-feishu", "-c", "/config/config.yaml"]
 ```yaml
 version: '3.8'
 services:
-  matrix-appservice-feishu:
+  matrix-bridge-feishu:
     build: .
     ports:
       - "8080:8080"
@@ -258,7 +258,7 @@ After=network.target
 [Service]
 Type=simple
 User=matrix
-ExecStart=/usr/local/bin/matrix-appservice-feishu -c /etc/matrix-appservice-feishu/config.yaml
+ExecStart=/usr/local/bin/matrix-bridge-feishu -c /etc/matrix-bridge-feishu/config.yaml
 Restart=always
 
 [Install]
@@ -271,7 +271,7 @@ Recommended host layout:
 
 ```text
 /opt/matrix-bridge-feishu/
-  bin/matrix-appservice-feishu
+  bin/matrix-bridge-feishu
   config/config.yaml
   data/matrix-feishu.db
   logs/
@@ -311,10 +311,10 @@ pwsh ./scripts/release-check.ps1 `
 The bridge uses structured logging with `tracing`:
 ```bash
 # Set log level
-RUST_LOG=debug ./matrix-appservice-feishu -c config.yaml
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
 
 # Log to file
-RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
+RUST_LOG=info ./matrix-bridge-feishu -c config.yaml > bridge.log
 ```
 
 ### Stress Testing
@@ -375,7 +375,7 @@ Recommended starting production parameters (adjust from script output):
 
 ### Rollback Procedure
 
-1. Stop service (`systemctl stop matrix-appservice-feishu`).
+1. Stop service (`systemctl stop matrix-bridge-feishu`).
 2. Backup current DB before rollback:
    ```bash
    sqlite3 /opt/matrix-bridge-feishu/data/matrix-feishu.db ".backup '/opt/matrix-bridge-feishu/data/matrix-feishu.db.pre_rollback'"
@@ -400,7 +400,7 @@ Recommended starting production parameters (adjust from script output):
 
 Enable debug logging:
 ```bash
-RUST_LOG=debug ./matrix-appservice-feishu -c config.yaml
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
 ```
 
 ## Security

@@ -41,13 +41,13 @@
 1. **克隆并构建**
    ```bash
    git clone <repository-url>
-   cd matrix-appservice-feishu
+   cd matrix-bridge-feishu
    cargo build --release
    ```
 
 2. **生成配置模板**
    ```bash
-   ./target/release/matrix-appservice-feishu --generate-config > config.yaml
+   ./target/release/matrix-bridge-feishu --generate-config > config.yaml
    ```
 
 3. **配置桥接参数**
@@ -72,7 +72,7 @@
 
 5. **启动服务**
    ```bash
-   ./target/release/matrix-appservice-feishu -c config.yaml
+   ./target/release/matrix-bridge-feishu -c config.yaml
    ```
 
 ## 配置说明
@@ -156,11 +156,11 @@ Authorization: Bearer <token>
 ### 运维 CLI 命令
 
 ```bash
-./target/release/matrix-appservice-feishu -c config.yaml status
-./target/release/matrix-appservice-feishu -c config.yaml mappings --limit 50 --offset 0
-./target/release/matrix-appservice-feishu -c config.yaml replay --id 123
-./target/release/matrix-appservice-feishu -c config.yaml replay --status pending --limit 20
-./target/release/matrix-appservice-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
+./target/release/matrix-bridge-feishu -c config.yaml status
+./target/release/matrix-bridge-feishu -c config.yaml mappings --limit 50 --offset 0
+./target/release/matrix-bridge-feishu -c config.yaml replay --id 123
+./target/release/matrix-bridge-feishu -c config.yaml replay --status pending --limit 20
+./target/release/matrix-bridge-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
 ```
 
 可配合 `--admin-api http://host:port/admin` 与 `--token <provisioning_token>` 操作远端实例。
@@ -226,9 +226,9 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates
-COPY --from=builder /app/target/release/matrix-appservice-feishu /usr/local/bin/
+COPY --from=builder /app/target/release/matrix-bridge-feishu /usr/local/bin/
 EXPOSE 8080 8081
-CMD ["matrix-appservice-feishu", "-c", "/config/config.yaml"]
+CMD ["matrix-bridge-feishu", "-c", "/config/config.yaml"]
 ```
 
 ### Docker Compose
@@ -236,7 +236,7 @@ CMD ["matrix-appservice-feishu", "-c", "/config/config.yaml"]
 ```yaml
 version: '3.8'
 services:
-  matrix-appservice-feishu:
+  matrix-bridge-feishu:
     build: .
     ports:
       - "8080:8080"
@@ -258,7 +258,7 @@ After=network.target
 [Service]
 Type=simple
 User=matrix
-ExecStart=/usr/local/bin/matrix-appservice-feishu -c /etc/matrix-appservice-feishu/config.yaml
+ExecStart=/usr/local/bin/matrix-bridge-feishu -c /etc/matrix-bridge-feishu/config.yaml
 Restart=always
 
 [Install]
@@ -271,7 +271,7 @@ WantedBy=multi-user.target
 
 ```text
 /opt/matrix-bridge-feishu/
-  bin/matrix-appservice-feishu
+  bin/matrix-bridge-feishu
   config/config.yaml
   data/matrix-feishu.db
   logs/
@@ -312,10 +312,10 @@ pwsh ./scripts/release-check.ps1 `
 
 ```bash
 # Debug 级别
-RUST_LOG=debug ./matrix-appservice-feishu -c config.yaml
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
 
 # 输出到文件
-RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
+RUST_LOG=info ./matrix-bridge-feishu -c config.yaml > bridge.log
 ```
 
 ### 压测
@@ -378,7 +378,7 @@ pwsh ./scripts/stress-batch-messages.ps1 `
 
 ### 回滚流程
 
-1. 停止服务：`systemctl stop matrix-appservice-feishu`
+1. 停止服务：`systemctl stop matrix-bridge-feishu`
 2. 回滚前备份当前数据库：
    ```bash
    sqlite3 /opt/matrix-bridge-feishu/data/matrix-feishu.db ".backup '/opt/matrix-bridge-feishu/data/matrix-feishu.db.pre_rollback'"
@@ -402,7 +402,7 @@ pwsh ./scripts/stress-batch-messages.ps1 `
 ### Debug 模式
 
 ```bash
-RUST_LOG=debug ./matrix-appservice-feishu -c config.yaml
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
 ```
 
 ## 安全建议

@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  matrix-appservice-feishu:
+  matrix-bridge-feishu:
     build: .
-    container_name: matrix-appservice-feishu
+    container_name: matrix-bridge-feishu
     ports:
       - "8080:8080"  # Matrix appservice API
       - "8081:8081"  # Feishu webhook
@@ -25,7 +25,7 @@ services:
   # Optional: PostgreSQL for production
   postgres:
     image: postgres:15-alpine
-    container_name: matrix-appservice-feishu-db
+    container_name: matrix-bridge-feishu-db
     environment:
       POSTGRES_DB: matrix_feishu
       POSTGRES_USER: matrix

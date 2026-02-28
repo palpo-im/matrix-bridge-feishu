@@ -11,7 +11,7 @@ use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
-#[command(name = "matrix-appservice-feishu")]
+#[command(name = "matrix-bridge-feishu")]
 #[command(version)]
 #[command(about = "A Matrix-Feishu puppeting bridge")]
 struct CliArgs {
