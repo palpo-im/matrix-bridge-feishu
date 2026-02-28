@@ -432,8 +432,18 @@ Use the built-in pre-release checker:
 
 ```powershell
 pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml
-pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml -SkipHttpChecks
+pwsh ./scripts/release-check.ps1 `
+  -ConfigPath ./config.yaml `
+  -SubscribedEvents "im.message.receive_v1,im.message.recalled_v1,im.chat.member.user.added_v1,im.chat.member.user.deleted_v1,im.chat.updated_v1,im.chat.disbanded_v1" `
+  -ScopeProbeChatId <chat_id> `
+  -ScopeProbeUserId <user_id>
 ```
+
+Coverage now includes four risk classes:
+- Config consistency: URL/db/token/encryption consistency checks
+- Permission checks: read/write/delete provisioning token scope verification
+- Event subscription checks: required Feishu event list validation
+- Data health checks: SQLite quick check + required key table existence/counters
 
 ## Contributing
 

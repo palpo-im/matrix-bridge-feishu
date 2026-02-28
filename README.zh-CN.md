@@ -137,8 +137,18 @@ pwsh ./scripts/stress-batch-messages.ps1 `
 
 ```powershell
 pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml
-pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml -SkipHttpChecks
+pwsh ./scripts/release-check.ps1 `
+  -ConfigPath ./config.yaml `
+  -SubscribedEvents "im.message.receive_v1,im.message.recalled_v1,im.chat.member.user.added_v1,im.chat.member.user.deleted_v1,im.chat.updated_v1,im.chat.disbanded_v1" `
+  -ScopeProbeChatId <chat_id> `
+  -ScopeProbeUserId <user_id>
 ```
+
+当前脚本覆盖四类发布风险：
+- 配置一致性：URL/数据库/token/加密组合检查
+- 权限校验：read/write/delete 三类 provisioning token 权限校验
+- 事件订阅校验：飞书必需事件列表比对
+- 数据健康校验：SQLite quick_check + 关键表存在性与计数检查
 
 ## 常用开发命令
 
