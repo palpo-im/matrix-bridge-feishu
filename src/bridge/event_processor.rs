@@ -16,6 +16,7 @@ use crate::database::{
     EventStore, MediaStore, MessageMapping, MessageStore, ProcessedEvent, RoomMapping, RoomStore,
 };
 use crate::feishu::{FeishuMessageSendData, FeishuService};
+use crate::util::build_trace_id;
 use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Debug, Clone)]
@@ -86,8 +87,11 @@ impl MatrixEventProcessor {
     pub async fn process_event(&self, event: MatrixEvent) -> anyhow::Result<()> {
         let _timer = ScopedTimer::new("matrix_event_process");
         let matrix_event_id = event.event_id.as_deref().unwrap_or("unknown");
+        let trace_id = build_trace_id("matrix_in", event.event_id.as_deref(), None);
         global_metrics().record_inbound_event(&format!("matrix:{}", event.event_type));
+        global_metrics().record_trace_event("matrix_in", "received");
         debug!(
+            trace_id = %trace_id,
             matrix_event_id = %matrix_event_id,
             event_type = %event.event_type,
             chat_id = %event.room_id,
@@ -96,7 +100,12 @@ impl MatrixEventProcessor {
 
         if let Some(ref event_id) = event.event_id {
             if self.event_store.is_event_processed(event_id).await? {
-                debug!(matrix_event_id = %event_id, "Skipping already processed Matrix event");
+                global_metrics().record_trace_event("matrix_in", "duplicate");
+                debug!(
+                    trace_id = %trace_id,
+                    matrix_event_id = %event_id,
+                    "Skipping already processed Matrix event"
+                );
                 return Ok(());
             }
         }
@@ -130,6 +139,8 @@ impl MatrixEventProcessor {
             self.event_store.mark_event_processed(&processed).await?;
         }
 
+        global_metrics().record_trace_event("matrix_in", "processed");
+
         Ok(())
     }
 
@@ -138,6 +149,7 @@ impl MatrixEventProcessor {
             debug!("Message event has no content");
             return Ok(());
         };
+        let trace_id = build_trace_id("mx_to_feishu", event.event_id.as_deref(), None);
         let content_for_policy = content
             .get("m.new_content")
             .filter(|value| value.is_object())
@@ -161,7 +173,9 @@ impl MatrixEventProcessor {
             .contains(&matrix_msgtype.to_ascii_lowercase())
         {
             global_metrics().record_policy_block("msgtype_blocked");
+            global_metrics().record_trace_event("mx_to_feishu", "blocked_msgtype");
             warn!(
+                trace_id = %trace_id,
                 matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                 chat_id = %event.room_id,
                 msgtype = %matrix_msgtype,
@@ -171,7 +185,9 @@ impl MatrixEventProcessor {
         }
         if !self.rate_limiter.allow(&event.room_id) {
             global_metrics().record_policy_block("rate_limited");
+            global_metrics().record_trace_event("mx_to_feishu", "blocked_rate_limit");
             warn!(
+                trace_id = %trace_id,
                 matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                 chat_id = %event.room_id,
                 "Dropping Matrix event due to per-room rate limit"
@@ -186,11 +202,13 @@ impl MatrixEventProcessor {
 
         let Some(mapping) = room_mapping else {
             debug!("No room mapping found for room {}", event.room_id);
+            global_metrics().record_trace_event("mx_to_feishu", "unmapped_room");
             return Ok(());
         };
 
         let Some(inbound) = parse_matrix_inbound(event) else {
             debug!("Failed to parse message event");
+            global_metrics().record_trace_event("mx_to_feishu", "parse_skipped");
             return Ok(());
         };
 
@@ -200,7 +218,9 @@ impl MatrixEventProcessor {
                 truncate_text(&outbound.content, self.config.bridge.max_text_length);
             if changed {
                 global_metrics().record_degraded_event("text_truncated");
+                global_metrics().record_trace_event("mx_to_feishu", "text_truncated");
                 warn!(
+                    trace_id = %trace_id,
                     matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                     chat_id = %event.room_id,
                     max_text_length = self.config.bridge.max_text_length,
@@ -216,7 +236,9 @@ impl MatrixEventProcessor {
             .get_message_by_content_hash(&content_hash)
             .await?
         {
+            global_metrics().record_trace_event("mx_to_feishu", "deduped");
             debug!(
+                trace_id = %trace_id,
                 matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                 dedupe_hash = %content_hash,
                 feishu_message_id = %existing.feishu_message_id,
@@ -226,6 +248,7 @@ impl MatrixEventProcessor {
         }
 
         if let Some(event_id) = &outbound.edit_of {
+            global_metrics().record_trace_event("mx_to_feishu", "edit");
             self.dispatcher
                 .handle_edit_message(event_id, &outbound)
                 .await?;
@@ -267,11 +290,14 @@ impl MatrixEventProcessor {
             Ok(message) => message,
             Err(err) => {
                 if !self.config.bridge.enable_failure_degrade {
+                    global_metrics().record_trace_event("mx_to_feishu", "failed");
                     return Err(err);
                 }
 
                 global_metrics().record_degraded_event("delivery_failure");
+                global_metrics().record_trace_event("mx_to_feishu", "degraded");
                 warn!(
+                    trace_id = %trace_id,
                     matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                     chat_id = %event.room_id,
                     feishu_chat_id = %mapping.feishu_chat_id,
@@ -285,6 +311,11 @@ impl MatrixEventProcessor {
         };
 
         if let (Some(event_id), Some(feishu_message)) = (&event.event_id, primary_feishu_message) {
+            let link_trace_id = build_trace_id(
+                "mx_to_feishu",
+                Some(event_id.as_str()),
+                Some(&feishu_message.message_id),
+            );
             let link = MessageMapping::new(
                 event_id.clone(),
                 feishu_message.message_id,
@@ -301,6 +332,7 @@ impl MatrixEventProcessor {
 
             if let Err(err) = self.message_store.create_message_mapping(&link).await {
                 warn!(
+                    trace_id = %link_trace_id,
                     matrix_event_id = %event_id,
                     feishu_message_id = %link.feishu_message_id,
                     chat_id = %event.room_id,
@@ -308,14 +340,19 @@ impl MatrixEventProcessor {
                     "Failed to persist Matrix->Feishu message mapping"
                 );
             }
-        }
 
-        info!(
-            matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
-            chat_id = %event.room_id,
-            feishu_chat_id = %mapping.feishu_chat_id,
-            "Bridged Matrix message to Feishu"
-        );
+            global_metrics().record_trace_event("mx_to_feishu", "success");
+            info!(
+                trace_id = %link_trace_id,
+                matrix_event_id = %event_id,
+                feishu_message_id = %link.feishu_message_id,
+                chat_id = %event.room_id,
+                feishu_chat_id = %mapping.feishu_chat_id,
+                "Bridged Matrix message to Feishu"
+            );
+            return Ok(());
+        }
+        global_metrics().record_trace_event("mx_to_feishu", "attachments_only_or_empty");
 
         Ok(())
     }
@@ -326,6 +363,7 @@ impl MatrixEventProcessor {
         event: &MatrixEvent,
         err: &anyhow::Error,
     ) {
+        let trace_id = build_trace_id("mx_to_feishu", event.event_id.as_deref(), None);
         let template = self.config.bridge.failure_notice_template.trim();
         if template.is_empty() {
             return;
@@ -338,6 +376,7 @@ impl MatrixEventProcessor {
             .await
         {
             warn!(
+                trace_id = %trace_id,
                 matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
                 chat_id = %event.room_id,
                 feishu_chat_id = %mapping.feishu_chat_id,

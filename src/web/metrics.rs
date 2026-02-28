@@ -12,6 +12,7 @@ pub struct BridgeMetrics {
     outbound_failures_total: AtomicU64,
     policy_blocked_total: AtomicU64,
     degraded_events_total: AtomicU64,
+    trace_events_total: AtomicU64,
     cache_hits_total: AtomicU64,
     cache_misses_total: AtomicU64,
     queue_depth: AtomicU64,
@@ -21,6 +22,7 @@ pub struct BridgeMetrics {
     outbound_failures_by_api_code: Mutex<HashMap<String, u64>>,
     policy_blocked_by_reason: Mutex<HashMap<String, u64>>,
     degraded_events_by_reason: Mutex<HashMap<String, u64>>,
+    trace_events_by_flow_status: Mutex<HashMap<String, u64>>,
     cache_hits_by_name: Mutex<HashMap<String, u64>>,
     cache_misses_by_name: Mutex<HashMap<String, u64>>,
     processing_stats: Mutex<HashMap<String, ProcessingStats>>,
@@ -63,6 +65,12 @@ impl BridgeMetrics {
     pub fn record_degraded_event(&self, reason: &str) {
         self.degraded_events_total.fetch_add(1, Ordering::Relaxed);
         increment_map(&self.degraded_events_by_reason, reason.to_string());
+    }
+
+    pub fn record_trace_event(&self, flow: &str, status: &str) {
+        self.trace_events_total.fetch_add(1, Ordering::Relaxed);
+        let key = format!("{}|{}", flow, status);
+        increment_map(&self.trace_events_by_flow_status, key);
     }
 
     pub fn record_cache_hit(&self, cache_name: &str) {
@@ -190,6 +198,24 @@ impl BridgeMetrics {
             body.push_str(&format!(
                 "bridge_degraded_events_total_by_reason{{reason=\"{}\"}} {}\n",
                 escape_label(&reason),
+                count
+            ));
+        }
+
+        body.push_str("# HELP bridge_trace_events_total Total traced bridge flow events\n");
+        body.push_str("# TYPE bridge_trace_events_total counter\n");
+        body.push_str(&format!(
+            "bridge_trace_events_total {}\n",
+            self.trace_events_total.load(Ordering::Relaxed)
+        ));
+        for (flow_status, count) in sorted_pairs(&self.trace_events_by_flow_status) {
+            let mut parts = flow_status.splitn(2, '|');
+            let flow = parts.next().unwrap_or("unknown");
+            let status = parts.next().unwrap_or("unknown");
+            body.push_str(&format!(
+                "bridge_trace_events_total_by_flow_status{{flow=\"{}\",status=\"{}\"}} {}\n",
+                escape_label(flow),
+                escape_label(status),
                 count
             ));
         }

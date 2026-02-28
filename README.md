@@ -301,6 +301,7 @@ RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
 - **Permission denied on send**: check Feishu app scopes for message send/read and file/image APIs.
 - **Rate limit spikes**: monitor `/metrics` fields `bridge_outbound_failures_total_by_api_code` and tune retry env vars `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`.
 - **Policy drops / degraded send path**: monitor `/metrics` fields `bridge_policy_blocked_total_by_reason` and `bridge_degraded_events_total_by_reason`.
+- **End-to-end traceability**: monitor `bridge_trace_events_total_by_flow_status` and search logs by `trace_id` with `matrix_event_id` or `feishu_message_id`.
 
 ### Debug Mode
 

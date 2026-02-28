@@ -16,7 +16,7 @@ use super::{
 };
 use crate::bridge::FeishuBridge;
 use crate::bridge::message::{Attachment, BridgeMessage, MessageType};
-use crate::util::{TtlCache, parse_feishu_api_error};
+use crate::util::{TtlCache, build_trace_id, parse_feishu_api_error};
 use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Clone)]
@@ -228,17 +228,26 @@ impl FeishuService {
             return Ok(());
         }
 
-        info!(event_type = %event_type, "Received Feishu event");
-        global_metrics().record_inbound_event(&event_type);
-
         let header_event_id = payload
             .pointer("/header/event_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
+        let webhook_trace_id = build_trace_id("feishu_webhook", header_event_id.as_deref(), None);
+
+        info!(
+            trace_id = %webhook_trace_id,
+            event_type = %event_type,
+            event_id = ?header_event_id,
+            "Received Feishu event"
+        );
+        global_metrics().record_inbound_event(&event_type);
+        global_metrics().record_trace_event("feishu_webhook", "received");
 
         if let Some(ref event_id) = header_event_id {
             if bridge.is_feishu_event_processed(event_id).await? {
+                global_metrics().record_trace_event("feishu_webhook", "duplicate");
                 debug!(
+                    trace_id = %webhook_trace_id,
                     event_id = %event_id,
                     event_type = %event_type,
                     "Skipping duplicate Feishu webhook event"
@@ -269,8 +278,10 @@ impl FeishuService {
                         .clone()
                         .unwrap_or_else(|| feishu_message_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge.handle_feishu_message(bridge_message_for_task).await {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.message.receive_v1",
                             chat_id = %chat_id,
@@ -311,6 +322,7 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
@@ -335,11 +347,13 @@ impl FeishuService {
                         .clone()
                         .unwrap_or_else(|| message_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
                         .handle_feishu_message_recalled(&chat_id, &message_id)
                         .await
                     {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.message.recalled_v1",
                             chat_id = %chat_id,
@@ -380,6 +394,7 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
@@ -405,11 +420,13 @@ impl FeishuService {
                     event_type_for_task,
                     event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
                         .handle_feishu_chat_member_added(&chat_id, &user_ids)
                         .await
                     {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.chat.member.user.added_v1",
                             chat_id = %chat_id,
@@ -449,6 +466,7 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
@@ -474,11 +492,13 @@ impl FeishuService {
                     event_type_for_task,
                     event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
                         .handle_feishu_chat_member_deleted(&chat_id, &user_ids)
                         .await
                     {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.chat.member.user.deleted_v1",
                             chat_id = %chat_id,
@@ -518,6 +538,7 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
@@ -545,11 +566,13 @@ impl FeishuService {
                     event_type_for_task,
                     event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge
                         .handle_feishu_chat_updated(&chat_id, chat_name, chat_mode, chat_type)
                         .await
                     {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.chat.updated_v1",
                             chat_id = %chat_id,
@@ -589,6 +612,7 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
@@ -609,8 +633,10 @@ impl FeishuService {
                     event_type_for_task,
                     event_id_for_task.clone().unwrap_or_else(|| chat_id.clone())
                 );
+                global_metrics().record_trace_event("feishu_webhook", "queued");
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge.handle_feishu_chat_disbanded(&chat_id).await {
+                        global_metrics().record_trace_event("feishu_webhook", "failed");
                         error!(
                             event_type = "im.chat.disbanded_v1",
                             chat_id = %chat_id,
@@ -650,12 +676,14 @@ impl FeishuService {
                             );
                         }
                     }
+                    global_metrics().record_trace_event("feishu_webhook", "processed");
                 })
                 .await;
                 res.status_code(StatusCode::OK);
                 res.render("accepted");
             }
             _ => {
+                global_metrics().record_trace_event("feishu_webhook", "ignored");
                 debug!(event_type = %event_type, "Ignoring unsupported Feishu event type");
                 res.status_code(StatusCode::OK);
                 res.render("ignored");

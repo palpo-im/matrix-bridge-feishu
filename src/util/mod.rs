@@ -3,6 +3,7 @@ use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
+use sha2::{Digest, Sha256};
 
 pub struct UidGenerator {
     cache: HashMap<String, String>,
@@ -172,4 +173,18 @@ fn capture_error_field(message: &str, marker: &str) -> Option<String> {
     } else {
         Some(raw.to_string())
     }
+}
+
+pub fn build_trace_id(
+    flow: &str,
+    matrix_event_id: Option<&str>,
+    feishu_message_id: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(flow.as_bytes());
+    hasher.update(matrix_event_id.unwrap_or("").as_bytes());
+    hasher.update(feishu_message_id.unwrap_or("").as_bytes());
+    let digest = hasher.finalize();
+    let compact = hex::encode(digest);
+    format!("{}-{}", flow, &compact[..16])
 }

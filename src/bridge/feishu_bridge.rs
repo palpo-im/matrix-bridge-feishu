@@ -32,7 +32,8 @@ use crate::database::{
 };
 use crate::feishu::FeishuService;
 use crate::formatter;
-use crate::web::{ProvisioningApi, ScopedTimer, metrics_endpoint};
+use crate::util::build_trace_id;
+use crate::web::{ProvisioningApi, ScopedTimer, global_metrics, metrics_endpoint};
 
 type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -637,7 +638,10 @@ impl FeishuBridge {
 
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
         let _timer = ScopedTimer::new("feishu_message_process");
+        let trace_id = build_trace_id("feishu_to_matrix", None, Some(&message.id));
+        global_metrics().record_trace_event("feishu_to_matrix", "received");
         info!(
+            trace_id = %trace_id,
             feishu_message_id = %message.id,
             chat_id = %message.room_id,
             "Handling Feishu message"
@@ -650,7 +654,9 @@ impl FeishuBridge {
             .await?
             .is_some()
         {
+            global_metrics().record_trace_event("feishu_to_matrix", "duplicate");
             debug!(
+                trace_id = %trace_id,
                 feishu_message_id = %message.id,
                 chat_id = %message.room_id,
                 "Skipping already bridged Feishu message (duplicate or echo)"
@@ -784,7 +790,9 @@ impl FeishuBridge {
                 .create_message_mapping(&link)
                 .await
             {
+                global_metrics().record_trace_event("feishu_to_matrix", "mapping_store_failed");
                 warn!(
+                    trace_id = %trace_id,
                     matrix_event_id = %link.matrix_event_id,
                     feishu_message_id = %link.feishu_message_id,
                     chat_id = %message.room_id,
@@ -792,7 +800,19 @@ impl FeishuBridge {
                     "Failed to persist Feishu->Matrix message mapping"
                 );
             }
+
+            global_metrics().record_trace_event("feishu_to_matrix", "success");
+            info!(
+                trace_id = %trace_id,
+                matrix_event_id = %link.matrix_event_id,
+                feishu_message_id = %link.feishu_message_id,
+                chat_id = %message.room_id,
+                "Bridged Feishu message to Matrix"
+            );
+            return Ok(());
         }
+
+        global_metrics().record_trace_event("feishu_to_matrix", "attachments_only_or_empty");
 
         Ok(())
     }

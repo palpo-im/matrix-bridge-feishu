@@ -103,6 +103,7 @@ cargo run -- -c config.yaml dead-letter-cleanup --status replayed --older-than-h
 - 权限不足：检查飞书应用消息收发、资源读取、图片/文件上传权限。
 - 频控触发：查看 `/metrics` 的失败码指标，并调节 `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`。
 - 策略阻断/降级：查看 `/metrics` 中 `bridge_policy_blocked_total_by_reason` 与 `bridge_degraded_events_total_by_reason`。
+- 链路追踪：查看 `bridge_trace_events_total_by_flow_status`，并用日志字段 `trace_id` 关联 `matrix_event_id` / `feishu_message_id`。
 
 ## 发布前自检脚本
 
