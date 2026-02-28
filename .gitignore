@@ -53,3 +53,5 @@ coverage/
 # Distribution files
 dist/
 build/
+_todos.md
+_diff.md

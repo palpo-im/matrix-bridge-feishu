@@ -2,25 +2,6 @@
 
 基于 Rust 与 Salvo 的 Matrix <-> 飞书桥接服务。
 
-## 当前状态（2026-02-15）
-
-此前未完成的关键链路已补齐，当前版本可编译并可运行。
-
-- 构建依赖已修复：`cargo check` / `cargo test` 可通过。
-- 已实现 Matrix appservice 事务接收与事件分发。
-- 已实现飞书 webhook 接收、签名校验、URL 验证、事件解析与入桥处理。
-- 已补齐 Matrix <-> 飞书消息转发入口与格式转换调用。
-- 已修复数据库模块声明、类型定义与路由处理器等编译阻塞问题。
-- 当前桥接存储仅支持 SQLite（`appservice.database.type` 必须为 `sqlite`）。
-
-## 已有能力（代码层面）
-
-- 配置加载与基础校验（YAML）。
-- Appservice / bridge / formatter / feishu 模块化结构。
-- SQLite 初始化与基础建表逻辑。
-- 飞书 API 客户端框架（鉴权、发消息、上传图片等接口封装）。
-- Matrix 与飞书消息格式转换的基础实现（文本、富文本、卡片、媒体占位等）。
-
 ## 快速开始（开发）
 
 1. 安装 Rust 1.75 或更高版本。
