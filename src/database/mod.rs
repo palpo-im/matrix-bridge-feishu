@@ -113,6 +113,7 @@ impl Database {
                 tokio::task::spawn_blocking(move || -> Result<()> {
                     let mut conn = pool.get()?;
                     conn.batch_execute(SQLITE_MIGRATIONS)?;
+                    ensure_sqlite_message_mapping_columns(&mut conn)?;
                     Ok(())
                 })
                 .await
@@ -264,9 +265,6 @@ CREATE INDEX IF NOT EXISTS idx_message_mappings_matrix_id ON message_mappings(ma
 CREATE INDEX IF NOT EXISTS idx_message_mappings_feishu_id ON message_mappings(feishu_message_id);
 CREATE INDEX IF NOT EXISTS idx_message_mappings_room ON message_mappings(room_id);
 CREATE INDEX IF NOT EXISTS idx_processed_events_event_id ON processed_events(event_id);
-ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS thread_id TEXT;
-ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS root_id TEXT;
-ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS parent_id TEXT;
 "#;
 
 const POSTGRES_MIGRATIONS: &str = r#"
@@ -382,3 +380,16 @@ ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS thread_id TEXT;
 ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS root_id TEXT;
 ALTER TABLE message_mappings ADD COLUMN IF NOT EXISTS parent_id TEXT;
 "#;
+
+fn ensure_sqlite_message_mapping_columns(conn: &mut SqliteConnection) -> Result<()> {
+    for column in ["thread_id", "root_id", "parent_id"] {
+        let statement = format!("ALTER TABLE message_mappings ADD COLUMN {} TEXT", column);
+        if let Err(err) = conn.batch_execute(&statement) {
+            let message = err.to_string().to_ascii_lowercase();
+            if !message.contains("duplicate column name") {
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(())
+}

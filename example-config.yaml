@@ -1,4 +1,9 @@
 # Matrix-Feishu Bridge Configuration
+# You can override key fields with env vars:
+# - CONFIG_PATH
+# - MATRIX_BRIDGE_FEISHU_DB_TYPE / MATRIX_BRIDGE_FEISHU_DB_URI
+# - MATRIX_BRIDGE_FEISHU_AS_TOKEN / MATRIX_BRIDGE_FEISHU_HS_TOKEN
+# - MATRIX_BRIDGE_FEISHU_BRIDGE_APP_ID / MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET
 
 # Homeserver configuration
 homeserver:

@@ -167,7 +167,7 @@ impl RoomStore for SqliteStores {
         let mapping = mapping.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
-            let sqlite_mapping = SqliteRoomMapping::from_model(&mapping);
+            let sqlite_mapping = NewSqliteRoomMapping::from_model(&mapping);
             diesel::insert_into(room_mappings::table)
                 .values(&sqlite_mapping)
                 .execute(&mut conn)
@@ -309,7 +309,7 @@ impl UserStore for SqliteStores {
         let mapping = mapping.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
-            let sqlite_mapping = SqliteUserMapping::from_model(&mapping);
+            let sqlite_mapping = NewSqliteUserMapping::from_model(&mapping);
             diesel::insert_into(user_mappings::table)
                 .values(&sqlite_mapping)
                 .execute(&mut conn)
@@ -420,7 +420,7 @@ impl MessageStore for SqliteStores {
         let mapping = mapping.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
-            let sqlite_mapping = SqliteMessageMapping::from_model(&mapping);
+            let sqlite_mapping = NewSqliteMessageMapping::from_model(&mapping);
             diesel::insert_into(message_mappings::table)
                 .values(&sqlite_mapping)
                 .execute(&mut conn)
@@ -490,7 +490,7 @@ impl EventStore for SqliteStores {
         let event = event.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
-            let sqlite_event = SqliteProcessedEvent::from_model(&event);
+            let sqlite_event = NewSqliteProcessedEvent::from_model(&event);
             diesel::insert_into(processed_events::table)
                 .values(&sqlite_event)
                 .execute(&mut conn)
@@ -530,6 +530,17 @@ struct SqliteRoomMapping {
     updated_at: String,
 }
 
+#[derive(Insertable)]
+#[diesel(table_name = room_mappings)]
+struct NewSqliteRoomMapping {
+    matrix_room_id: String,
+    feishu_chat_id: String,
+    feishu_chat_name: Option<String>,
+    feishu_chat_type: String,
+    created_at: String,
+    updated_at: String,
+}
+
 impl SqliteRoomMapping {
     fn from_model(model: &RoomMapping) -> Self {
         Self {
@@ -560,10 +571,34 @@ impl SqliteRoomMapping {
     }
 }
 
+impl NewSqliteRoomMapping {
+    fn from_model(model: &RoomMapping) -> Self {
+        Self {
+            matrix_room_id: model.matrix_room_id.clone(),
+            feishu_chat_id: model.feishu_chat_id.clone(),
+            feishu_chat_name: model.feishu_chat_name.clone(),
+            feishu_chat_type: model.feishu_chat_type.clone(),
+            created_at: model.created_at.to_rfc3339(),
+            updated_at: model.updated_at.to_rfc3339(),
+        }
+    }
+}
+
 #[derive(Queryable, Insertable, AsChangeset)]
 #[diesel(table_name = user_mappings)]
 struct SqliteUserMapping {
     id: i64,
+    matrix_user_id: String,
+    feishu_user_id: String,
+    feishu_username: Option<String>,
+    feishu_avatar: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = user_mappings)]
+struct NewSqliteUserMapping {
     matrix_user_id: String,
     feishu_user_id: String,
     feishu_username: Option<String>,
@@ -602,6 +637,19 @@ impl SqliteUserMapping {
     }
 }
 
+impl NewSqliteUserMapping {
+    fn from_model(model: &UserMapping) -> Self {
+        Self {
+            matrix_user_id: model.matrix_user_id.clone(),
+            feishu_user_id: model.feishu_user_id.clone(),
+            feishu_username: model.feishu_username.clone(),
+            feishu_avatar: model.feishu_avatar.clone(),
+            created_at: model.created_at.to_rfc3339(),
+            updated_at: model.updated_at.to_rfc3339(),
+        }
+    }
+}
+
 #[derive(Queryable, Insertable)]
 #[diesel(table_name = message_mappings)]
 struct SqliteMessageMapping {
@@ -618,23 +666,22 @@ struct SqliteMessageMapping {
     created_at: String,
 }
 
-impl SqliteMessageMapping {
-    fn from_model(model: &MessageMapping) -> Self {
-        Self {
-            id: model.id,
-            matrix_event_id: model.matrix_event_id.clone(),
-            feishu_message_id: model.feishu_message_id.clone(),
-            thread_id: model.thread_id.clone(),
-            root_id: model.root_id.clone(),
-            parent_id: model.parent_id.clone(),
-            room_id: model.room_id.clone(),
-            sender_mxid: model.sender_mxid.clone(),
-            sender_feishu_id: model.sender_feishu_id.clone(),
-            content_hash: model.content_hash.clone(),
-            created_at: model.created_at.to_rfc3339(),
-        }
-    }
+#[derive(Insertable)]
+#[diesel(table_name = message_mappings)]
+struct NewSqliteMessageMapping {
+    matrix_event_id: String,
+    feishu_message_id: String,
+    thread_id: Option<String>,
+    root_id: Option<String>,
+    parent_id: Option<String>,
+    room_id: String,
+    sender_mxid: String,
+    sender_feishu_id: String,
+    content_hash: Option<String>,
+    created_at: String,
+}
 
+impl SqliteMessageMapping {
     fn into_model(self) -> MessageMapping {
         MessageMapping {
             id: self.id,
@@ -654,6 +701,23 @@ impl SqliteMessageMapping {
     }
 }
 
+impl NewSqliteMessageMapping {
+    fn from_model(model: &MessageMapping) -> Self {
+        Self {
+            matrix_event_id: model.matrix_event_id.clone(),
+            feishu_message_id: model.feishu_message_id.clone(),
+            thread_id: model.thread_id.clone(),
+            root_id: model.root_id.clone(),
+            parent_id: model.parent_id.clone(),
+            room_id: model.room_id.clone(),
+            sender_mxid: model.sender_mxid.clone(),
+            sender_feishu_id: model.sender_feishu_id.clone(),
+            content_hash: model.content_hash.clone(),
+            created_at: model.created_at.to_rfc3339(),
+        }
+    }
+}
+
 #[derive(Queryable, Insertable)]
 #[diesel(table_name = processed_events)]
 struct SqliteProcessedEvent {
@@ -664,10 +728,21 @@ struct SqliteProcessedEvent {
     processed_at: String,
 }
 
+#[derive(Insertable)]
+#[diesel(table_name = processed_events)]
+struct NewSqliteProcessedEvent {
+    event_id: String,
+    event_type: String,
+    source: String,
+    processed_at: String,
+}
+
 impl SqliteProcessedEvent {
+}
+
+impl NewSqliteProcessedEvent {
     fn from_model(model: &ProcessedEvent) -> Self {
         Self {
-            id: model.id,
             event_id: model.event_id.clone(),
             event_type: model.event_type.clone(),
             source: model.source.clone(),

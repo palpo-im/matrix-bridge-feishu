@@ -47,6 +47,47 @@ cargo run -- -c config.yaml
 
 详情见 `example-config.yaml`。
 
+可通过环境变量覆盖关键配置：
+
+```bash
+export CONFIG_PATH="/etc/matrix-bridge-feishu/config.yaml"
+export MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET="real-secret"
+export MATRIX_BRIDGE_FEISHU_DB_URI="sqlite:matrix-feishu.db"
+export MATRIX_BRIDGE_FEISHU_AS_TOKEN="real_as_token"
+```
+
+Provisioning 接口默认启用 Bearer 鉴权：
+
+- `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN`：用于查询/创建。
+- `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN`：用于删除映射（高风险操作）。
+
+## 能力矩阵（当前）
+
+| 能力 | 状态 | 说明 |
+|---|---|---|
+| `im.message.receive_v1` | 已支持 | 文本/富文本/图片/文件/音频/视频/卡片解析 |
+| `im.message.recalled_v1` | 已支持 | 通过 mapping 回撤 Matrix 消息 |
+| `im.chat.member.user.added_v1` | 已支持 | 同步成员加入提示与审计日志 |
+| `im.chat.member.user.deleted_v1` | 已支持 | 同步成员离开提示与审计日志 |
+| `im.chat.updated_v1` | 已支持 | 同步群信息与 thread 模式策略 |
+| `im.chat.disbanded_v1` | 已支持 | 自动清理映射并通知 Matrix |
+| Matrix 回复/编辑/撤回 | 已支持 | 对应飞书 reply/update/delete API |
+| Thread/topic 映射 | 已支持 | 维护 `thread_id/root_id/parent_id` |
+| PostgreSQL stores | 未支持 | 当前桥接存储仅支持 SQLite |
+
+## 排障要点
+
+- 签名失败：核对 `bridge.listen_secret` 与 `X-Lark-*` 签名头。
+- 权限不足：检查飞书应用消息收发、资源读取、图片/文件上传权限。
+- 频控触发：查看 `/metrics` 的失败码指标，并调节 `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`。
+
+## 发布前自检脚本
+
+```powershell
+pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml
+pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml -SkipHttpChecks
+```
+
 ## 常用开发命令
 
 ```bash

@@ -14,6 +14,7 @@ use super::{
 };
 use crate::bridge::FeishuBridge;
 use crate::bridge::message::{Attachment, BridgeMessage, MessageType};
+use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Clone)]
 pub struct FeishuService {
@@ -120,8 +121,10 @@ impl FeishuService {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
+        let queue_guard = global_metrics().begin_queue_task();
 
         tokio::spawn(async move {
+            let _queue_guard = queue_guard;
             let _guard = queue_lock.lock().await;
             task.await;
         });
@@ -133,6 +136,7 @@ impl FeishuService {
         res: &mut Response,
         bridge: FeishuBridge,
     ) -> Result<()> {
+        let _timer = ScopedTimer::new("feishu_webhook_ack");
         debug!("Received Feishu webhook request");
 
         let body_bytes = req
@@ -200,7 +204,8 @@ impl FeishuService {
             return Ok(());
         }
 
-        info!("Received Feishu event: {}", event_type);
+        info!(event_type = %event_type, "Received Feishu event");
+        global_metrics().record_inbound_event(&event_type);
 
         match event_type.as_str() {
             "im.message.receive_v1" | "message.receive_v1" => {
@@ -208,9 +213,16 @@ impl FeishuService {
                     .webhook_event_to_bridge_message(&payload)
                     .context("failed to parse receive event")?;
                 let chat_id = bridge_message.room_id.clone();
-                self.queue_chat_task(chat_id, async move {
+                let feishu_message_id = bridge_message.id.clone();
+                self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge.handle_feishu_message(bridge_message).await {
-                        error!("Failed to process Feishu receive event: {}", err);
+                        error!(
+                            event_type = "im.message.receive_v1",
+                            chat_id = %chat_id,
+                            feishu_message_id = %feishu_message_id,
+                            error = %err,
+                            "Failed to process Feishu receive event"
+                        );
                     }
                 })
                 .await;
@@ -228,7 +240,13 @@ impl FeishuService {
                         .handle_feishu_message_recalled(&chat_id, &message_id)
                         .await
                     {
-                        error!("Failed to process Feishu recalled event: {}", err);
+                        error!(
+                            event_type = "im.message.recalled_v1",
+                            chat_id = %chat_id,
+                            feishu_message_id = %message_id,
+                            error = %err,
+                            "Failed to process Feishu recalled event"
+                        );
                     }
                 })
                 .await;
@@ -245,7 +263,12 @@ impl FeishuService {
                         .handle_feishu_chat_member_added(&chat_id, &event.user_ids)
                         .await
                     {
-                        error!("Failed to process Feishu member added event: {}", err);
+                        error!(
+                            event_type = "im.chat.member.user.added_v1",
+                            chat_id = %chat_id,
+                            error = %err,
+                            "Failed to process Feishu member added event"
+                        );
                     }
                 })
                 .await;
@@ -262,7 +285,12 @@ impl FeishuService {
                         .handle_feishu_chat_member_deleted(&chat_id, &event.user_ids)
                         .await
                     {
-                        error!("Failed to process Feishu member deleted event: {}", err);
+                        error!(
+                            event_type = "im.chat.member.user.deleted_v1",
+                            chat_id = %chat_id,
+                            error = %err,
+                            "Failed to process Feishu member deleted event"
+                        );
                     }
                 })
                 .await;
@@ -284,7 +312,12 @@ impl FeishuService {
                         )
                         .await
                     {
-                        error!("Failed to process Feishu chat updated event: {}", err);
+                        error!(
+                            event_type = "im.chat.updated_v1",
+                            chat_id = %chat_id,
+                            error = %err,
+                            "Failed to process Feishu chat updated event"
+                        );
                     }
                 })
                 .await;
@@ -297,7 +330,12 @@ impl FeishuService {
                     .context("failed to parse chat disbanded event")?;
                 self.queue_chat_task(chat_id.clone(), async move {
                     if let Err(err) = bridge.handle_feishu_chat_disbanded(&chat_id).await {
-                        error!("Failed to process Feishu chat disbanded event: {}", err);
+                        error!(
+                            event_type = "im.chat.disbanded_v1",
+                            chat_id = %chat_id,
+                            error = %err,
+                            "Failed to process Feishu chat disbanded event"
+                        );
                     }
                 })
                 .await;
@@ -305,7 +343,7 @@ impl FeishuService {
                 res.render("accepted");
             }
             _ => {
-                debug!("Ignoring unsupported Feishu event type: {}", event_type);
+                debug!(event_type = %event_type, "Ignoring unsupported Feishu event type");
                 res.status_code(StatusCode::OK);
                 res.render("ignored");
             }
@@ -641,8 +679,14 @@ impl FeishuService {
     }
 
     pub async fn get_user(&self, user_id: &str) -> Result<FeishuUser> {
+        let api = "contact.v3.users.get";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.get_user(user_id).await
+        let result = client.get_user(user_id).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn send_message(
@@ -653,15 +697,27 @@ impl FeishuService {
         content: Value,
         uuid: Option<String>,
     ) -> Result<FeishuMessageSendData> {
+        let api = "im.v1.messages.create";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client
+        let result = client
             .send_message(receive_id_type, receive_id, msg_type, content, uuid)
-            .await
+            .await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn send_text_message(&self, chat_id: &str, content: &str) -> Result<String> {
+        let api = "im.v1.messages.create";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.send_text_message(chat_id, content).await
+        let result = client.send_text_message(chat_id, content).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn send_rich_text_message(
@@ -669,8 +725,14 @@ impl FeishuService {
         chat_id: &str,
         rich_text: &FeishuRichText,
     ) -> Result<String> {
+        let api = "im.v1.messages.create";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.send_rich_text_message(chat_id, rich_text).await
+        let result = client.send_rich_text_message(chat_id, rich_text).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn reply_message(
@@ -681,10 +743,16 @@ impl FeishuService {
         reply_in_thread: bool,
         uuid: Option<String>,
     ) -> Result<FeishuMessageSendData> {
+        let api = "im.v1.messages.reply";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client
+        let result = client
             .reply_message(message_id, msg_type, content, reply_in_thread, uuid)
-            .await
+            .await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn update_message(
@@ -693,18 +761,36 @@ impl FeishuService {
         msg_type: &str,
         content: Value,
     ) -> Result<FeishuMessageSendData> {
+        let api = "im.v1.messages.update";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.update_message(message_id, msg_type, content).await
+        let result = client.update_message(message_id, msg_type, content).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn recall_message(&self, message_id: &str) -> Result<()> {
+        let api = "im.v1.messages.delete";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.recall_message(message_id).await
+        let result = client.recall_message(message_id).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn get_message(&self, message_id: &str) -> Result<Option<FeishuMessageData>> {
+        let api = "im.v1.messages.get";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.get_message(message_id).await
+        let result = client.get_message(message_id).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn get_message_resource(
@@ -713,15 +799,27 @@ impl FeishuService {
         file_key: &str,
         resource_type: &str,
     ) -> Result<Vec<u8>> {
+        let api = "im.v1.messages.resources.get";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client
+        let result = client
             .get_message_resource(message_id, file_key, resource_type)
-            .await
+            .await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn upload_image(&self, image_data: Vec<u8>, image_type: &str) -> Result<String> {
+        let api = "im.v1.images.create";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.upload_image(image_data, image_type, "message").await
+        let result = client.upload_image(image_data, image_type, "message").await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 
     pub async fn upload_file(
@@ -730,8 +828,14 @@ impl FeishuService {
         file_data: Vec<u8>,
         file_type: &str,
     ) -> Result<String> {
+        let api = "im.v1.files.create";
+        global_metrics().record_outbound_call(api);
         let mut client = self.client.lock().await;
-        client.upload_file(file_name, file_data, file_type).await
+        let result = client.upload_file(file_name, file_data, file_type).await;
+        if let Err(err) = &result {
+            global_metrics().record_outbound_failure(api, &extract_error_code(err));
+        }
+        result
     }
 }
 
@@ -843,6 +947,18 @@ fn build_attachment(kind: &str, key: &str, mime_type: &str) -> Attachment {
         size: 0,
         mime_type: mime_type.to_string(),
     }
+}
+
+fn extract_error_code(err: &anyhow::Error) -> String {
+    let message = err.to_string();
+    if let Some(idx) = message.find("code=") {
+        let suffix = &message[idx + 5..];
+        let code: String = suffix.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if !code.is_empty() {
+            return code;
+        }
+    }
+    "unknown".to_string()
 }
 
 fn pick_first_string(root: &Value, pointers: &[&str]) -> Option<String> {
@@ -983,5 +1099,66 @@ mod tests {
         assert_eq!(parsed.chat_name.as_deref(), Some("Bridge Chat"));
         assert_eq!(parsed.chat_mode.as_deref(), Some("thread"));
         assert_eq!(parsed.chat_type.as_deref(), Some("group"));
+    }
+
+    #[test]
+    fn parse_receive_event_image_extracts_attachment_and_thread_fields() {
+        let service = build_service();
+        let payload = json!({
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "user_id": "ou_sender"
+                    }
+                },
+                "message": {
+                    "message_id": "om_1",
+                    "chat_id": "oc_chat",
+                    "msg_type": "image",
+                    "parent_id": "om_parent",
+                    "thread_id": "omt_thread",
+                    "root_id": "om_root",
+                    "create_time": "1700000000",
+                    "content": "{\"image_key\":\"img_key_1\"}"
+                }
+            }
+        });
+
+        let parsed = service
+            .webhook_event_to_bridge_message(&payload)
+            .expect("receive event should parse");
+        assert_eq!(parsed.id, "om_1");
+        assert_eq!(parsed.room_id, "oc_chat");
+        assert_eq!(parsed.attachments.len(), 1);
+        assert_eq!(parsed.attachments[0].url, "feishu://image/img_key_1");
+        assert_eq!(parsed.thread_id.as_deref(), Some("omt_thread"));
+        assert_eq!(parsed.root_id.as_deref(), Some("om_root"));
+        assert_eq!(parsed.parent_id.as_deref(), Some("om_parent"));
+    }
+
+    #[test]
+    fn parse_receive_event_post_extracts_text_content() {
+        let service = build_service();
+        let payload = json!({
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_sender"
+                    }
+                },
+                "message": {
+                    "message_id": "om_2",
+                    "chat_id": "oc_chat",
+                    "msg_type": "post",
+                    "create_time": "1700000000",
+                    "content": "{\"zh_cn\":{\"content\":[[{\"tag\":\"text\",\"text\":\"hello\"},{\"tag\":\"text\",\"text\":\" world\"}]]}}"
+                }
+            }
+        });
+
+        let parsed = service
+            .webhook_event_to_bridge_message(&payload)
+            .expect("post receive event should parse");
+        assert_eq!(parsed.content, "hello world");
     }
 }

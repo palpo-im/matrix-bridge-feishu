@@ -16,7 +16,7 @@ use super::types::*;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
-const FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
+const DEFAULT_FEISHU_API_BASE: &str = "https://open.feishu.cn/open-apis";
 const IMAGE_SIZE_LIMIT: usize = 10 * 1024 * 1024;
 const FILE_SIZE_LIMIT: usize = 30 * 1024 * 1024;
 const RESOURCE_DOWNLOAD_LIMIT: usize = 100 * 1024 * 1024;
@@ -79,6 +79,14 @@ impl FeishuClient {
         }
     }
 
+    fn api_base() -> String {
+        std::env::var("FEISHU_API_BASE_URL")
+            .ok()
+            .map(|value| value.trim_end_matches('/').to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_FEISHU_API_BASE.to_string())
+    }
+
     pub async fn get_tenant_access_token(&mut self) -> Result<String> {
         if let Some(expires_at) = self.token_expires_at {
             if chrono::Utc::now() < expires_at {
@@ -86,7 +94,7 @@ impl FeishuClient {
             }
         }
 
-        let url = format!("{}/auth/v3/tenant_access_token/internal", FEISHU_API_BASE);
+        let url = format!("{}/auth/v3/tenant_access_token/internal", Self::api_base());
         let payload = json!({
             "app_id": self.app_id,
             "app_secret": self.app_secret,
@@ -117,7 +125,7 @@ impl FeishuClient {
 
     pub async fn get_user(&mut self, user_id: &str) -> Result<FeishuUser> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/contact/v3/users/{}", FEISHU_API_BASE, user_id);
+        let url = format!("{}/contact/v3/users/{}", Self::api_base(), user_id);
 
         let response = self
             .execute_json(
@@ -160,7 +168,8 @@ impl FeishuClient {
         let access_token = self.get_tenant_access_token().await?;
         let url = format!(
             "{}/im/v1/messages?receive_id_type={}",
-            FEISHU_API_BASE, receive_id_type
+            Self::api_base(),
+            receive_id_type
         );
         let payload = Self::build_message_payload(receive_id, msg_type, content, uuid)?;
 
@@ -186,7 +195,7 @@ impl FeishuClient {
         uuid: Option<String>,
     ) -> Result<FeishuMessageSendData> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/messages/{}/reply", FEISHU_API_BASE, message_id);
+        let url = format!("{}/im/v1/messages/{}/reply", Self::api_base(), message_id);
 
         let mut payload = json!({
             "msg_type": msg_type,
@@ -221,7 +230,7 @@ impl FeishuClient {
         content: Value,
     ) -> Result<FeishuMessageSendData> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+        let url = format!("{}/im/v1/messages/{}", Self::api_base(), message_id);
         let payload = json!({
             "msg_type": msg_type,
             "content": serde_json::to_string(&content)
@@ -243,7 +252,7 @@ impl FeishuClient {
 
     pub async fn recall_message(&mut self, message_id: &str) -> Result<()> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+        let url = format!("{}/im/v1/messages/{}", Self::api_base(), message_id);
 
         let response = self
             .execute_json(
@@ -259,7 +268,7 @@ impl FeishuClient {
 
     pub async fn get_message(&mut self, message_id: &str) -> Result<Option<FeishuMessageData>> {
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/messages/{}", FEISHU_API_BASE, message_id);
+        let url = format!("{}/im/v1/messages/{}", Self::api_base(), message_id);
 
         let response = self
             .execute_json(
@@ -283,7 +292,10 @@ impl FeishuClient {
         let access_token = self.get_tenant_access_token().await?;
         let url = format!(
             "{}/im/v1/messages/{}/resources/{}?type={}",
-            FEISHU_API_BASE, message_id, file_key, resource_type
+            Self::api_base(),
+            message_id,
+            file_key,
+            resource_type
         );
         let max_retries = self.max_retries();
         let mut attempts = 0_u32;
@@ -387,7 +399,7 @@ impl FeishuClient {
         }
 
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/images", FEISHU_API_BASE);
+        let url = format!("{}/im/v1/images", Self::api_base());
 
         let form = reqwest::multipart::Form::new()
             .text("image_type", image_use.to_string())
@@ -427,7 +439,7 @@ impl FeishuClient {
         }
 
         let access_token = self.get_tenant_access_token().await?;
-        let url = format!("{}/im/v1/files", FEISHU_API_BASE);
+        let url = format!("{}/im/v1/files", Self::api_base());
 
         let part = reqwest::multipart::Part::bytes(file_data)
             .file_name(file_name.to_string())

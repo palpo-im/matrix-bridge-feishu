@@ -93,8 +93,10 @@ The bridge is built with a modular architecture:
 
 You can override configuration with environment variables:
 ```bash
-export APPSERVICE_FEISHU_BRIDGE_APP_SECRET="your-secret"
-export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="sqlite:matrix-feishu.db"
+export CONFIG_PATH="/etc/matrix-bridge-feishu/config.yaml"
+export MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET="real-secret"
+export MATRIX_BRIDGE_FEISHU_DB_URI="sqlite:matrix-feishu.db"
+export MATRIX_BRIDGE_FEISHU_AS_TOKEN="real_as_token"
 ```
 
 ## Feishu Setup
@@ -123,9 +125,21 @@ export APPSERVICE_FEISHU_APPSERVICE_DATABASE_URI="sqlite:matrix-feishu.db"
 ### Matrix Appservice API
 - `/_matrix/app/*` - Matrix appservice endpoints
 - `/health` - Health check endpoint
+- `/metrics` - Prometheus metrics endpoint
 
 ### Feishu Webhook
 - `/webhook` - Receives messages from Feishu
+
+### Provisioning Security
+
+Provisioning endpoints require bearer token authentication:
+
+```bash
+Authorization: Bearer <token>
+```
+
+- Read/Create endpoints use `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN` (defaults to `appservice.as_token`).
+- Delete endpoints require `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN` (defaults to provisioning token).
 
 ## Database
 
@@ -232,6 +246,7 @@ WantedBy=multi-user.target
 ### Health Checks
 
 - HTTP health endpoint at `/health`
+- Prometheus metrics endpoint at `/metrics`
 - Process monitoring with systemd or Docker
 - Database connection monitoring
 
@@ -255,6 +270,12 @@ RUST_LOG=info ./matrix-appservice-feishu -c config.yaml > bridge.log
 3. **Database Error**: Check database connection and permissions
 4. **Message Not Bridged**: Check webhook configuration and URL
 5. **Encryption Error**: Verify encryption key and verification token
+
+### Focused Playbook
+
+- **Webhook signature failed**: verify `bridge.listen_secret` and request headers `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`, `X-Lark-Signature`.
+- **Permission denied on send**: check Feishu app scopes for message send/read and file/image APIs.
+- **Rate limit spikes**: monitor `/metrics` fields `bridge_outbound_failures_total_by_api_code` and tune retry env vars `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`.
 
 ### Debug Mode
 
@@ -311,6 +332,36 @@ Feishu card messages are converted to Matrix messages:
 - Audio → `m.audio`
 - Video → `m.video`
 - Card → Formatted `m.text`
+
+## Capability Matrix
+
+| Capability | Status | Notes |
+|---|---|---|
+| `im.message.receive_v1` | Supported | Text/post/image/file/audio/media/sticker/interactive parsing |
+| `im.message.recalled_v1` | Supported | Redacts mapped Matrix event |
+| `im.chat.member.user.added_v1` | Supported | Emits Matrix notice + audit logs |
+| `im.chat.member.user.deleted_v1` | Supported | Emits Matrix notice + audit logs |
+| `im.chat.updated_v1` | Supported | Updates mapping metadata + thread mode strategy |
+| `im.chat.disbanded_v1` | Supported | Deletes room/message mappings and notifies Matrix |
+| Matrix reply/edit/redaction | Supported | Routed to Feishu reply/update/delete APIs |
+| Thread/topic mapping | Supported | Stores and bridges `thread_id/root_id/parent_id` |
+| Postgres stores | Not supported | Bridge stores are SQLite-only in current build |
+
+## Required Feishu Setup
+
+1. Create a self-built Feishu app and install it to target chats.
+2. Grant scopes for message send/receive, message resource read, image/file upload.
+3. Configure event subscriptions: receive, recalled, chat member added/deleted, chat updated/disbanded.
+4. Configure callback security: `listen_secret` and optionally `encrypt_key + verification_token`.
+
+## Release Check Script
+
+Use the built-in pre-release checker:
+
+```powershell
+pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml
+pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml -SkipHttpChecks
+```
 
 ## Contributing
 

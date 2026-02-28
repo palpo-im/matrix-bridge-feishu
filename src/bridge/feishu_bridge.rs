@@ -29,7 +29,7 @@ use crate::database::sqlite_stores::SqliteStores;
 use crate::database::{Database, EventStore, MessageMapping, MessageStore, RoomStore};
 use crate::feishu::FeishuService;
 use crate::formatter;
-use crate::web::ProvisioningApi;
+use crate::web::{ProvisioningApi, ScopedTimer, metrics_endpoint};
 
 type SqlitePool = Pool<ConnectionManager<SqliteConnection>>;
 
@@ -196,7 +196,16 @@ impl FeishuBridge {
         .with_handler(handler);
 
         let base_router = appservice_with_handler.router();
-        let provisioning_api = ProvisioningApi::new(self.room_store(), self.provisioning.clone());
+        let provisioning_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN")
+            .unwrap_or_else(|_| self.config.appservice.as_token.clone());
+        let provisioning_admin_token = std::env::var("MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN")
+            .unwrap_or_else(|_| provisioning_token.clone());
+        let provisioning_api = ProvisioningApi::new(
+            self.room_store(),
+            self.provisioning.clone(),
+            provisioning_token,
+            provisioning_admin_token,
+        );
         let status_state = BridgeStatusState {
             room_store: self.room_store(),
             started_at: self.started_at,
@@ -205,6 +214,7 @@ impl FeishuBridge {
         let health_router = Router::new()
             .push(Router::with_path("/health").get(health_handler))
             .push(Router::with_path("/ready").get(ready_handler))
+            .push(Router::with_path("/metrics").get(metrics_endpoint))
             .push(
                 Router::with_path("/status")
                     .hoop(affix_state::inject(status_state))
@@ -268,9 +278,11 @@ impl FeishuBridge {
     }
 
     pub async fn handle_feishu_message(&self, message: BridgeMessage) -> anyhow::Result<()> {
+        let _timer = ScopedTimer::new("feishu_message_process");
         info!(
-            "Handling Feishu message {} in room {}",
-            message.id, message.room_id
+            feishu_message_id = %message.id,
+            chat_id = %message.room_id,
+            "Handling Feishu message"
         );
 
         if self
@@ -281,8 +293,9 @@ impl FeishuBridge {
             .is_some()
         {
             debug!(
-                "Skipping already bridged Feishu message (duplicate or echo): {}",
-                message.id
+                feishu_message_id = %message.id,
+                chat_id = %message.room_id,
+                "Skipping already bridged Feishu message (duplicate or echo)"
             );
             return Ok(());
         }
@@ -380,7 +393,13 @@ impl FeishuBridge {
                 .create_message_mapping(&link)
                 .await
             {
-                warn!("Failed to persist Feishu->Matrix message mapping: {}", err);
+                warn!(
+                    matrix_event_id = %link.matrix_event_id,
+                    feishu_message_id = %link.feishu_message_id,
+                    chat_id = %message.room_id,
+                    error = %err,
+                    "Failed to persist Feishu->Matrix message mapping"
+                );
             }
         }
 
@@ -393,8 +412,9 @@ impl FeishuBridge {
         feishu_message_id: &str,
     ) -> anyhow::Result<()> {
         info!(
-            "Handling Feishu recalled event: chat={} message={}",
-            feishu_chat_id, feishu_message_id
+            chat_id = %feishu_chat_id,
+            feishu_message_id = %feishu_message_id,
+            "Handling Feishu recalled event"
         );
 
         let mapping = self
@@ -405,8 +425,9 @@ impl FeishuBridge {
 
         let Some(mapping) = mapping else {
             debug!(
-                "No message mapping found for recalled Feishu message {}",
-                feishu_message_id
+                feishu_message_id = %feishu_message_id,
+                chat_id = %feishu_chat_id,
+                "No message mapping found for recalled Feishu message"
             );
             return Ok(());
         };

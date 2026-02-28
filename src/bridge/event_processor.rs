@@ -14,6 +14,7 @@ use crate::database::{
     EventStore, MessageMapping, MessageStore, ProcessedEvent, RoomMapping, RoomStore,
 };
 use crate::feishu::{FeishuMessageSendData, FeishuService};
+use crate::web::{ScopedTimer, global_metrics};
 
 #[derive(Debug, Clone)]
 pub struct MatrixEvent {
@@ -60,14 +61,19 @@ impl MatrixEventProcessor {
     }
 
     pub async fn process_event(&self, event: MatrixEvent) -> anyhow::Result<()> {
+        let _timer = ScopedTimer::new("matrix_event_process");
+        let matrix_event_id = event.event_id.as_deref().unwrap_or("unknown");
+        global_metrics().record_inbound_event(&format!("matrix:{}", event.event_type));
         debug!(
-            "Processing Matrix event: {:?} type={} room={}",
-            event.event_id, event.event_type, event.room_id
+            matrix_event_id = %matrix_event_id,
+            event_type = %event.event_type,
+            chat_id = %event.room_id,
+            "Processing Matrix event"
         );
 
         if let Some(ref event_id) = event.event_id {
             if self.event_store.is_event_processed(event_id).await? {
-                debug!("Skipping already processed event: {}", event_id);
+                debug!(matrix_event_id = %event_id, "Skipping already processed Matrix event");
                 return Ok(());
             }
         }
@@ -86,7 +92,7 @@ impl MatrixEventProcessor {
                 self.handle_reaction_event(&event).await?;
             }
             _ => {
-                debug!("Ignoring event type: {}", event.event_type);
+                debug!(event_type = %event.event_type, "Ignoring Matrix event type");
             }
         }
 
@@ -178,15 +184,20 @@ impl MatrixEventProcessor {
             );
             if let Err(err) = self.message_store.create_message_mapping(&link).await {
                 warn!(
-                    "Failed to persist Matrix->Feishu message mapping for event {}: {}",
-                    event_id, err
+                    matrix_event_id = %event_id,
+                    feishu_message_id = %link.feishu_message_id,
+                    chat_id = %event.room_id,
+                    error = %err,
+                    "Failed to persist Matrix->Feishu message mapping"
                 );
             }
         }
 
         info!(
-            "Bridged Matrix message to Feishu: room={} chat={}",
-            event.room_id, mapping.feishu_chat_id
+            matrix_event_id = %event.event_id.as_deref().unwrap_or("unknown"),
+            chat_id = %event.room_id,
+            feishu_chat_id = %mapping.feishu_chat_id,
+            "Bridged Matrix message to Feishu"
         );
 
         Ok(())
@@ -255,8 +266,8 @@ impl MatrixEventProcessor {
 
         let Some(target) = target else {
             warn!(
-                "Matrix edit target event {} has no Feishu mapping",
-                matrix_target_event_id
+                matrix_event_id = %matrix_target_event_id,
+                "Matrix edit target has no Feishu mapping"
             );
             return Ok(());
         };
@@ -560,8 +571,11 @@ impl MatrixEventProcessor {
 
         if let Err(err) = self.message_store.delete_message_mapping(mapping.id).await {
             warn!(
-                "Failed to delete mapping after redaction {}: {}",
-                redacts_event_id, err
+                matrix_event_id = %redacts_event_id,
+                feishu_message_id = %mapping.feishu_message_id,
+                chat_id = %mapping.room_id,
+                error = %err,
+                "Failed to delete mapping after redaction"
             );
         }
 

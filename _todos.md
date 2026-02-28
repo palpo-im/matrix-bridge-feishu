@@ -94,24 +94,24 @@
 验收标准：重试策略可配置，日志区分不可重试错误与可重试错误。
 涉及文件：`src/feishu/client.rs` `src/config/*` `src/util/*`
 
-13. [ ] T013：可观测性增强（metrics + tracing 字段标准化）
+13. [x] T013：可观测性增强（metrics + tracing 字段标准化）
 实施要点：新增 Prometheus 指标（入站事件量、出站调用量、失败码、处理耗时、队列深度）；日志统一携带 `matrix_event_id/feishu_message_id/chat_id`。
 验收标准：`/metrics` 可抓取；可基于日志完整追一条消息链路。
 涉及文件：`src/web/*` `src/bridge/*` `src/feishu/*`
 
-14. [ ] T014：配置系统增强（环境变量覆盖 + 严格校验）
+14. [x] T014：配置系统增强（环境变量覆盖 + 严格校验）
 实施要点：支持 `CONFIG_PATH`、关键字段 env override；校验占位符配置值；校验权限/开关组合合法性。
 验收标准：错误配置在启动时快速失败并给出可操作报错。
 涉及文件：`src/config/mod.rs` `src/config/bridge.rs` `example-config.yaml`
 
-15. [ ] T015：Provisioning API 安全化
+15. [x] T015：Provisioning API 安全化
 实施要点：为 `/admin`、`/_matrix/app/v1` provisioning 路由增加认证与审计日志；限制高风险操作（删除映射）权限。
 验收标准：未授权请求无法进行桥接管理操作；审计日志包含操作者与变更对象。
 涉及文件：`src/web/provisioning.rs` `src/bridge/provisioning.rs`
 
 ## P2（完善测试、文档与交付）
 
-16. [ ] T016：单元测试补齐（解析、格式转换、安全校验）
+16. [x] T016：单元测试补齐（解析、格式转换、安全校验）
 实施要点：
 - webhook 签名/解密测试
 - 各 `msg_type` 解析与构造测试
@@ -119,12 +119,12 @@
 验收标准：新增关键模块测试覆盖，避免回归破坏核心桥接逻辑。
 涉及文件：`src/feishu/client.rs` `src/feishu/service.rs` `src/formatter/*` `src/bridge/message_flow.rs`
 
-17. [ ] T017：集成测试（Mock Feishu + Mock Matrix）
+17. [x] T017：集成测试（Mock Feishu + Mock Matrix）
 实施要点：构建本地 mock server，回放 `receive_v1/recalled_v1` 和 message API 响应；校验数据库 mapping 与最终发送行为。
 验收标准：CI 可自动跑通消息收发、编辑、撤回、媒体最小闭环。
 涉及文件：`tests/*` `.github/workflows/tests.yml`
 
-18. [ ] T018：文档与样例配置升级
+18. [x] T018：文档与样例配置升级
 实施要点：
 - README 增加“已支持/未支持”能力矩阵（按 Feishu msg_type/event）
 - 补充必需权限清单与后台配置步骤（事件订阅、加密策略、机器人权限）
@@ -132,7 +132,7 @@
 验收标准：新同学按 README 能在 30 分钟内完成最小可用部署。
 涉及文件：`README.md` `README.zh-CN.md` `example-config.yaml`
 
-19. [ ] T019：发布前验收脚本
+19. [x] T019：发布前验收脚本
 实施要点：新增 `scripts/release-check.ps1`（或等价脚本）自动检查：配置字段、数据库连接、回调可达性、API 权限、关键端点健康状态。
 验收标准：发布前可一键跑自检，失败点可定位到具体检查项。
 涉及文件：`scripts/*` `README*`
