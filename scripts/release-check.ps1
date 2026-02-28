@@ -97,6 +97,14 @@ if ($dbUri.StartsWith("sqlite:")) {
 if (-not $SkipHttpChecks) {
     $appBase = "http://$($cfg.appservice.hostname):$($cfg.appservice.port)"
     $feishuListen = [string]$cfg.bridge.listen_address
+    $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN
+    if ([string]::IsNullOrWhiteSpace($provisionToken)) {
+        $provisionToken = [string]$env:MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN
+    }
+    if ([string]::IsNullOrWhiteSpace($provisionToken)) {
+        $provisionToken = [string]$cfg.appservice.as_token
+    }
+    $encodedToken = [uri]::EscapeDataString($provisionToken)
     if (-not $feishuListen.StartsWith("http://") -and -not $feishuListen.StartsWith("https://")) {
         $feishuListen = "http://$feishuListen"
     }
@@ -110,6 +118,28 @@ if (-not $SkipHttpChecks) {
         }
     } catch {
         Add-Failure "Appservice health endpoint unreachable: $appBase/health"
+    }
+
+    try {
+        $resp = Invoke-WebRequest -UseBasicParsing -Uri "$appBase/admin/status?access_token=$encodedToken" -TimeoutSec 3
+        if ($resp.StatusCode -eq 200) {
+            Add-Pass "Provisioning status endpoint reachable: $appBase/admin/status"
+        } else {
+            Add-Failure "Provisioning status endpoint returned $($resp.StatusCode)"
+        }
+    } catch {
+        Add-Failure "Provisioning status endpoint unreachable: $appBase/admin/status"
+    }
+
+    try {
+        $resp = Invoke-WebRequest -UseBasicParsing -Uri "$appBase/admin/mappings?limit=1&offset=0&access_token=$encodedToken" -TimeoutSec 3
+        if ($resp.StatusCode -eq 200) {
+            Add-Pass "Provisioning mappings endpoint reachable: $appBase/admin/mappings"
+        } else {
+            Add-Failure "Provisioning mappings endpoint returned $($resp.StatusCode)"
+        }
+    } catch {
+        Add-Failure "Provisioning mappings endpoint unreachable: $appBase/admin/mappings"
     }
 
     try {

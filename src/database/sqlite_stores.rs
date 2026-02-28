@@ -606,6 +606,26 @@ impl DeadLetterStore for SqliteStores {
         .map_err(|e| DatabaseError::Query(e.to_string()))?
     }
 
+    async fn count_dead_letters(&self, status: Option<&str>) -> DatabaseResult<i64> {
+        let pool = self.pool.clone();
+        let status = status.map(ToOwned::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let mut query = dead_letters::table.into_boxed();
+            if let Some(status) = status {
+                query = query.filter(dead_letters::status.eq(status));
+            }
+
+            let count: i64 = query
+                .count()
+                .get_result(&mut conn)
+                .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(count)
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
     async fn list_dead_letters(
         &self,
         status: Option<&str>,
@@ -687,6 +707,47 @@ impl DeadLetterStore for SqliteStores {
                 .execute(&mut conn)
                 .map_err(DatabaseError::from)?;
             Ok::<_, DatabaseError>(())
+        })
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?
+    }
+
+    async fn cleanup_dead_letters(
+        &self,
+        status: Option<&str>,
+        older_than: Option<DateTime<Utc>>,
+        limit: Option<i64>,
+    ) -> DatabaseResult<u64> {
+        let pool = self.pool.clone();
+        let status = status.map(ToOwned::to_owned);
+        let older_than = older_than.map(|value| value.to_rfc3339());
+        let limit = limit.unwrap_or(200).max(1);
+
+        tokio::task::spawn_blocking(move || {
+            let mut conn = pool.get().map_err(|e| DatabaseError::Pool(e.to_string()))?;
+            let mut query = dead_letters::table.into_boxed();
+            if let Some(status) = status {
+                query = query.filter(dead_letters::status.eq(status));
+            }
+            if let Some(older_than) = older_than {
+                query = query.filter(dead_letters::updated_at.lt(older_than));
+            }
+
+            let candidate_ids: Vec<i64> = query
+                .order(dead_letters::id.asc())
+                .select(dead_letters::id)
+                .limit(limit)
+                .load(&mut conn)
+                .map_err(DatabaseError::from)?;
+            if candidate_ids.is_empty() {
+                return Ok::<_, DatabaseError>(0);
+            }
+
+            let deleted =
+                diesel::delete(dead_letters::table.filter(dead_letters::id.eq_any(candidate_ids)))
+                    .execute(&mut conn)
+                    .map_err(DatabaseError::from)?;
+            Ok::<_, DatabaseError>(deleted as u64)
         })
         .await
         .map_err(|e| DatabaseError::Query(e.to_string()))?

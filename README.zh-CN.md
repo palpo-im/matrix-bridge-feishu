@@ -43,6 +43,25 @@ Provisioning 接口默认启用 Bearer 鉴权：
 - `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN`：用于查询/创建。
 - `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN`：用于删除映射（高风险操作）。
 
+### 管理/运维接口
+
+- `GET /admin/status`：运行状态与 dead-letter 计数
+- `GET /admin/mappings`：当前 Matrix/飞书映射列表
+- `POST /admin/dead-letters/replay`：按状态/数量批量回放 dead-letter
+- `POST /admin/dead-letters/cleanup`：按状态/时间窗口清理 dead-letter
+
+### 运维 CLI 命令
+
+```bash
+cargo run -- -c config.yaml status
+cargo run -- -c config.yaml mappings --limit 50 --offset 0
+cargo run -- -c config.yaml replay --id 123
+cargo run -- -c config.yaml replay --status pending --limit 20
+cargo run -- -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
+```
+
+可通过 `--admin-api http://host:port/admin` 与 `--token <provisioning_token>` 操作远端实例。
+
 ## 能力矩阵（当前）
 
 ### 飞书消息类型（`msg_type`）

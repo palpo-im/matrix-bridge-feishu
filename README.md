@@ -142,6 +142,25 @@ Authorization: Bearer <token>
 - Read/Create endpoints use `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN` (defaults to `appservice.as_token`).
 - Delete endpoints require `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN` (defaults to provisioning token).
 
+### Provisioning/Ops Endpoints
+
+- `GET /admin/status` - bridge runtime status and dead-letter counters
+- `GET /admin/mappings` - list active Matrix/Feishu mappings
+- `POST /admin/dead-letters/replay` - batch replay dead-letters by status/limit
+- `POST /admin/dead-letters/cleanup` - cleanup dead-letters by status/time window
+
+### Ops CLI Commands
+
+```bash
+./target/release/matrix-appservice-feishu -c config.yaml status
+./target/release/matrix-appservice-feishu -c config.yaml mappings --limit 50 --offset 0
+./target/release/matrix-appservice-feishu -c config.yaml replay --id 123
+./target/release/matrix-appservice-feishu -c config.yaml replay --status pending --limit 20
+./target/release/matrix-appservice-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
+```
+
+Use `--admin-api http://host:port/admin` and `--token <provisioning_token>` to target remote instances.
+
 ## Database
 
 The bridge currently uses SQLite for bridge store persistence.

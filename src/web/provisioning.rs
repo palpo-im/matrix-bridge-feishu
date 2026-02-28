@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Instant;
 
+use chrono::{Duration, Utc};
 use salvo::affix_state;
 use salvo::oapi::extract::JsonBody;
 use salvo::prelude::*;
@@ -17,6 +19,7 @@ pub struct ProvisioningApi {
     provisioning: Arc<ProvisioningCoordinator>,
     token: String,
     admin_token: String,
+    started_at: Instant,
 }
 
 impl ProvisioningApi {
@@ -27,6 +30,7 @@ impl ProvisioningApi {
         provisioning: Arc<ProvisioningCoordinator>,
         token: String,
         admin_token: String,
+        started_at: Instant,
     ) -> Self {
         Self {
             room_store,
@@ -35,11 +39,13 @@ impl ProvisioningApi {
             provisioning,
             token,
             admin_token,
+            started_at,
         }
     }
 
     pub fn router(self) -> Router {
         Router::new()
+            .push(Router::with_path("status").get(provisioning_status))
             .push(Router::with_path("bridge").post(create_bridge))
             .push(Router::with_path("bridge/<room_id>").delete(delete_bridge))
             .push(
@@ -47,10 +53,13 @@ impl ProvisioningApi {
                     .get(list_bridges)
                     .post(create_bridge),
             )
+            .push(Router::with_path("mappings").get(list_mappings))
             .push(Router::with_path("bridges/<room_id>").delete(delete_bridge))
             .push(Router::with_path("pending").get(list_pending))
             .push(Router::with_path("dead-letters").get(list_dead_letters))
             .push(Router::with_path("dead-letters/<id>/replay").post(replay_dead_letter))
+            .push(Router::with_path("dead-letters/replay").post(replay_dead_letters))
+            .push(Router::with_path("dead-letters/cleanup").post(cleanup_dead_letters))
             .hoop(affix_state::inject(self))
     }
 }
@@ -66,6 +75,92 @@ pub struct BridgeRequest {
 pub struct BridgeResponse {
     pub success: bool,
     pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ProvisioningStatusResponse {
+    status: String,
+    version: String,
+    uptime_seconds: u64,
+    bridged_rooms: i64,
+    pending_requests: usize,
+    dead_letters: DeadLetterStatusSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct DeadLetterStatusSummary {
+    pending: i64,
+    failed: i64,
+    replayed: i64,
+    total: i64,
+}
+
+#[handler]
+async fn provisioning_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, false, res) else {
+        return;
+    };
+
+    info!(action = "status", actor = %actor, "Provisioning status requested");
+
+    let bridged_rooms = match api.room_store.count_rooms().await {
+        Ok(value) => value,
+        Err(err) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "success": false,
+                "message": err.to_string()
+            })));
+            return;
+        }
+    };
+
+    let pending_requests = api.provisioning.get_pending_requests().await.len();
+    let pending_dead_letters = api
+        .dead_letter_store
+        .count_dead_letters(Some("pending"))
+        .await;
+    let failed_dead_letters = api
+        .dead_letter_store
+        .count_dead_letters(Some("failed"))
+        .await;
+    let replayed_dead_letters = api
+        .dead_letter_store
+        .count_dead_letters(Some("replayed"))
+        .await;
+    let total_dead_letters = api.dead_letter_store.count_dead_letters(None).await;
+    let dead_letters = match (
+        pending_dead_letters,
+        failed_dead_letters,
+        replayed_dead_letters,
+        total_dead_letters,
+    ) {
+        (Ok(pending), Ok(failed), Ok(replayed), Ok(total)) => DeadLetterStatusSummary {
+            pending,
+            failed,
+            replayed,
+            total,
+        },
+        _ => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "success": false,
+                "message": "failed to collect dead-letter counters"
+            })));
+            return;
+        }
+    };
+
+    let body = ProvisioningStatusResponse {
+        status: "running".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds: api.started_at.elapsed().as_secs(),
+        bridged_rooms,
+        pending_requests,
+        dead_letters,
+    };
+    res.render(Json(body));
 }
 
 #[handler]
@@ -184,13 +279,51 @@ async fn list_bridges(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     let Some(actor) = require_auth(req, api, false, res) else {
         return;
     };
-    info!(action = "list_bridges", actor = %actor, "Provisioning list bridges");
+    let (limit, offset) = normalized_pagination(req, 100);
+    info!(
+        action = "list_bridges",
+        actor = %actor,
+        limit = ?limit,
+        offset = ?offset,
+        "Provisioning list bridges"
+    );
 
-    match api.room_store.list_room_mappings(Some(100), None).await {
+    match api.room_store.list_room_mappings(limit, offset).await {
         Ok(bridges) => {
             res.render(Json(serde_json::json!({
                 "bridges": bridges,
                 "count": bridges.len()
+            })));
+        }
+        Err(e) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "error": e.to_string()
+            })));
+        }
+    }
+}
+
+#[handler]
+async fn list_mappings(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, false, res) else {
+        return;
+    };
+    let (limit, offset) = normalized_pagination(req, 100);
+    info!(
+        action = "list_mappings",
+        actor = %actor,
+        limit = ?limit,
+        offset = ?offset,
+        "Provisioning list mappings"
+    );
+
+    match api.room_store.list_room_mappings(limit, offset).await {
+        Ok(mappings) => {
+            res.render(Json(serde_json::json!({
+                "mappings": mappings,
+                "count": mappings.len()
             })));
         }
         Err(e) => {
@@ -330,6 +463,204 @@ async fn replay_dead_letter(req: &mut Request, depot: &mut Depot, res: &mut Resp
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ReplayDeadLettersRequest {
+    ids: Option<Vec<i64>>,
+    status: Option<String>,
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayDeadLettersResponse {
+    success: bool,
+    requested: usize,
+    replayed: usize,
+    failed: usize,
+    failures: Vec<ReplayDeadLetterFailure>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayDeadLetterFailure {
+    id: i64,
+    error: String,
+}
+
+#[handler]
+async fn replay_dead_letters(
+    req: &mut Request,
+    body: JsonBody<ReplayDeadLettersRequest>,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, true, res) else {
+        return;
+    };
+
+    let ids = if let Some(ids) = &body.ids {
+        ids.clone()
+    } else {
+        let status = body.status.as_deref().unwrap_or("pending");
+        let limit = body.limit.unwrap_or(20).max(1);
+        match api
+            .dead_letter_store
+            .list_dead_letters(Some(status), Some(limit), Some(0))
+            .await
+        {
+            Ok(items) => items.into_iter().map(|item| item.id).collect(),
+            Err(err) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({
+                    "success": false,
+                    "message": err.to_string(),
+                })));
+                return;
+            }
+        }
+    };
+    info!(
+        action = "replay_dead_letters",
+        actor = %actor,
+        requested = ids.len(),
+        "Provisioning replay dead letters batch requested"
+    );
+
+    let mut replayed = 0usize;
+    let mut failures = Vec::new();
+    for id in ids.iter().copied() {
+        match api.bridge.replay_dead_letter(id).await {
+            Ok(()) => replayed += 1,
+            Err(err) => failures.push(ReplayDeadLetterFailure {
+                id,
+                error: err.to_string(),
+            }),
+        }
+    }
+
+    let response = ReplayDeadLettersResponse {
+        success: failures.is_empty(),
+        requested: ids.len(),
+        replayed,
+        failed: failures.len(),
+        failures,
+    };
+    if !response.success {
+        res.status_code(StatusCode::BAD_REQUEST);
+    }
+    res.render(Json(response));
+}
+
+#[derive(Debug, Deserialize)]
+struct DeadLetterCleanupRequest {
+    status: Option<String>,
+    older_than_hours: Option<i64>,
+    limit: Option<i64>,
+    dry_run: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeadLetterCleanupResponse {
+    success: bool,
+    status: Option<String>,
+    older_than_hours: Option<i64>,
+    limit: i64,
+    dry_run: bool,
+    matched: usize,
+    deleted: u64,
+    candidate_ids: Vec<i64>,
+}
+
+#[handler]
+async fn cleanup_dead_letters(
+    req: &mut Request,
+    body: JsonBody<DeadLetterCleanupRequest>,
+    depot: &mut Depot,
+    res: &mut Response,
+) {
+    let api: &ProvisioningApi = depot.obtain().unwrap();
+    let Some(actor) = require_auth(req, api, true, res) else {
+        return;
+    };
+
+    let status = body.status.clone();
+    let older_than_hours = body.older_than_hours.filter(|value| *value > 0);
+    let limit = body.limit.unwrap_or(200).max(1);
+    let dry_run = body.dry_run.unwrap_or(false);
+    let older_than = older_than_hours.map(|hours| Utc::now() - Duration::hours(hours));
+
+    info!(
+        action = "cleanup_dead_letters",
+        actor = %actor,
+        status = ?status,
+        older_than_hours = ?older_than_hours,
+        limit = limit,
+        dry_run = dry_run,
+        "Provisioning dead-letter cleanup requested"
+    );
+
+    if dry_run {
+        match api
+            .dead_letter_store
+            .list_dead_letters(status.as_deref(), Some(limit), Some(0))
+            .await
+        {
+            Ok(items) => {
+                let candidates: Vec<i64> = items
+                    .into_iter()
+                    .filter(|item| older_than.is_none_or(|boundary| item.updated_at < boundary))
+                    .map(|item| item.id)
+                    .collect();
+                let response = DeadLetterCleanupResponse {
+                    success: true,
+                    status,
+                    older_than_hours,
+                    limit,
+                    dry_run,
+                    matched: candidates.len(),
+                    deleted: 0,
+                    candidate_ids: candidates,
+                };
+                res.render(Json(response));
+            }
+            Err(err) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({
+                    "success": false,
+                    "message": err.to_string(),
+                })));
+            }
+        }
+        return;
+    }
+
+    match api
+        .dead_letter_store
+        .cleanup_dead_letters(status.as_deref(), older_than, Some(limit))
+        .await
+    {
+        Ok(deleted) => {
+            let response = DeadLetterCleanupResponse {
+                success: true,
+                status,
+                older_than_hours,
+                limit,
+                dry_run: false,
+                matched: deleted as usize,
+                deleted,
+                candidate_ids: Vec::new(),
+            };
+            res.render(Json(response));
+        }
+        Err(err) => {
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            res.render(Json(serde_json::json!({
+                "success": false,
+                "message": err.to_string(),
+            })));
+        }
+    }
+}
+
 fn require_auth(
     req: &Request,
     api: &ProvisioningApi,
@@ -337,12 +668,6 @@ fn require_auth(
     res: &mut Response,
 ) -> Option<String> {
     let provided = extract_access_token(req);
-    let expected = if admin_required {
-        api.admin_token.as_str()
-    } else {
-        api.token.as_str()
-    };
-
     let Some(token) = provided else {
         warn!(
             action = if admin_required { "admin_auth" } else { "auth" },
@@ -356,7 +681,12 @@ fn require_auth(
         return None;
     };
 
-    if token != expected {
+    let is_authorized = if admin_required {
+        token == api.admin_token
+    } else {
+        token == api.token || token == api.admin_token
+    };
+    if !is_authorized {
         warn!(
             action = if admin_required { "admin_auth" } else { "auth" },
             "Provisioning request token mismatch"
@@ -370,6 +700,15 @@ fn require_auth(
     }
 
     Some(resolve_actor(req, &token))
+}
+
+fn normalized_pagination(req: &Request, default_limit: i64) -> (Option<i64>, Option<i64>) {
+    let limit = req.query::<i64>("limit").map(|value| value.max(1));
+    let offset = req.query::<i64>("offset").map(|value| value.max(0));
+    (
+        Some(limit.unwrap_or(default_limit.max(1))),
+        Some(offset.unwrap_or(0)),
+    )
 }
 
 fn extract_access_token(req: &Request) -> Option<String> {

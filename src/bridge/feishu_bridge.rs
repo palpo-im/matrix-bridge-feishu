@@ -213,6 +213,7 @@ impl FeishuBridge {
             self.provisioning.clone(),
             provisioning_token,
             provisioning_admin_token,
+            self.started_at,
         );
         let status_state = BridgeStatusState {
             room_store: self.room_store(),

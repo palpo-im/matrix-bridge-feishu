@@ -85,6 +85,7 @@ pub trait EventStore: Send + Sync {
 #[async_trait]
 pub trait DeadLetterStore: Send + Sync {
     async fn create_dead_letter(&self, event: &DeadLetterEvent) -> DatabaseResult<DeadLetterEvent>;
+    async fn count_dead_letters(&self, status: Option<&str>) -> DatabaseResult<i64>;
     async fn list_dead_letters(
         &self,
         status: Option<&str>,
@@ -94,6 +95,12 @@ pub trait DeadLetterStore: Send + Sync {
     async fn get_dead_letter_by_id(&self, id: i64) -> DatabaseResult<Option<DeadLetterEvent>>;
     async fn mark_dead_letter_replayed(&self, id: i64) -> DatabaseResult<()>;
     async fn mark_dead_letter_failed(&self, id: i64, error: &str) -> DatabaseResult<()>;
+    async fn cleanup_dead_letters(
+        &self,
+        status: Option<&str>,
+        older_than: Option<DateTime<Utc>>,
+        limit: Option<i64>,
+    ) -> DatabaseResult<u64>;
 }
 
 #[async_trait]
