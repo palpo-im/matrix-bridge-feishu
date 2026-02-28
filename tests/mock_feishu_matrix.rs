@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -38,6 +39,22 @@ fn integration_test_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn set_env_var(key: &str, value: impl AsRef<OsStr>) {
+    // SAFETY: all callers run under `integration_test_lock()`, serializing env mutations
+    // within this test binary.
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+fn remove_env_var(key: &str) {
+    // SAFETY: all callers run under `integration_test_lock()`, serializing env mutations
+    // within this test binary.
+    unsafe {
+        std::env::remove_var(key);
+    }
+}
+
 #[tokio::test]
 async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
     let _test_guard = integration_test_lock()
@@ -45,8 +62,8 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         .expect("integration test mutex poisoned");
     let prev_no_proxy = std::env::var("NO_PROXY").ok();
     let prev_no_proxy_lower = std::env::var("no_proxy").ok();
-    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+    set_env_var("NO_PROXY", "127.0.0.1,localhost");
+    set_env_var("no_proxy", "127.0.0.1,localhost");
 
     let feishu_state = FeishuMockState {
         create_calls: Arc::new(AtomicU64::new(0)),
@@ -86,7 +103,7 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         .expect("pool should build");
     let stores = SqliteStores::new(pool);
 
-    std::env::set_var("FEISHU_API_BASE_URL", format!("{}/open-apis", feishu_base));
+    set_env_var("FEISHU_API_BASE_URL", format!("{}/open-apis", feishu_base));
     let config = Arc::new(build_test_config(&matrix_base, &db_uri));
     let feishu_service = Arc::new(FeishuService::new(
         "cli_app".to_string(),
@@ -324,16 +341,16 @@ async fn matrix_to_feishu_pipeline_with_mock_servers_persists_mapping() {
         "mapping should be removed after redaction"
     );
 
-    std::env::remove_var("FEISHU_API_BASE_URL");
+    remove_env_var("FEISHU_API_BASE_URL");
     if let Some(value) = prev_no_proxy {
-        std::env::set_var("NO_PROXY", value);
+        set_env_var("NO_PROXY", value);
     } else {
-        std::env::remove_var("NO_PROXY");
+        remove_env_var("NO_PROXY");
     }
     if let Some(value) = prev_no_proxy_lower {
-        std::env::set_var("no_proxy", value);
+        set_env_var("no_proxy", value);
     } else {
-        std::env::remove_var("no_proxy");
+        remove_env_var("no_proxy");
     }
     let _ = std::fs::remove_file(db_path);
 }
@@ -345,8 +362,8 @@ async fn matrix_to_feishu_media_oversize_fails_without_degrade() {
         .expect("integration test mutex poisoned");
     let prev_no_proxy = std::env::var("NO_PROXY").ok();
     let prev_no_proxy_lower = std::env::var("no_proxy").ok();
-    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
-    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+    set_env_var("NO_PROXY", "127.0.0.1,localhost");
+    set_env_var("no_proxy", "127.0.0.1,localhost");
 
     let feishu_state = FeishuMockState {
         create_calls: Arc::new(AtomicU64::new(0)),
@@ -386,7 +403,7 @@ async fn matrix_to_feishu_media_oversize_fails_without_degrade() {
         .expect("pool should build");
     let stores = SqliteStores::new(pool);
 
-    std::env::set_var("FEISHU_API_BASE_URL", format!("{}/open-apis", feishu_base));
+    set_env_var("FEISHU_API_BASE_URL", format!("{}/open-apis", feishu_base));
     let mut config = build_test_config(&matrix_base, &db_uri);
     config.bridge.max_media_size = 4;
     config.bridge.enable_failure_degrade = false;
@@ -454,16 +471,16 @@ async fn matrix_to_feishu_media_oversize_fails_without_degrade() {
         "media should still be downloaded before size rejection"
     );
 
-    std::env::remove_var("FEISHU_API_BASE_URL");
+    remove_env_var("FEISHU_API_BASE_URL");
     if let Some(value) = prev_no_proxy {
-        std::env::set_var("NO_PROXY", value);
+        set_env_var("NO_PROXY", value);
     } else {
-        std::env::remove_var("NO_PROXY");
+        remove_env_var("NO_PROXY");
     }
     if let Some(value) = prev_no_proxy_lower {
-        std::env::set_var("no_proxy", value);
+        set_env_var("no_proxy", value);
     } else {
-        std::env::remove_var("no_proxy");
+        remove_env_var("no_proxy");
     }
     let _ = std::fs::remove_file(db_path);
 }
