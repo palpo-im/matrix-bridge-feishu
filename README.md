@@ -1,0 +1,576 @@
+# Matrix Appservice Feishu
+
+A Matrix bridge for Feishu (飞书), built with Rust and the Salvo web framework.
+
+- English: `README.md`
+- 中文说明: `README.zh-CN.md`
+
+## Features
+
+- **Bidirectional messaging** between Matrix and Feishu
+- **Rich text and card message** support with proper conversion
+- **File/media sharing** including images, videos, and documents
+- **User and room synchronization** with proper mapping
+- **Long-connection event integration** with optional webhook compatibility
+- **High performance** built with Rust
+- **SQLite-backed persistence** for bridge mappings and event state
+- **Comprehensive logging** and error handling
+- **Encrypted callback message** support in webhook mode
+
+## Architecture
+
+The bridge is built with a modular architecture:
+
+- **Bridge Core**: Main application logic and state management
+- **Feishu Integration**: Feishu API client, long-connection event stream, and webhook compatibility
+- **Database Layer**: Diesel-based data persistence
+- **Message Formatting**: Conversion between Feishu and Matrix formats
+- **Web Services**: Salvo-based HTTP endpoints
+
+## Quick Start
+
+### Prerequisites
+
+- Rust 1.93+
+- SQLite
+- Matrix homeserver (Synapse, Dendrite, etc.)
+- Feishu app credentials
+
+### Installation
+
+1. **Clone and build:**
+   ```bash
+   git clone <repository-url>
+   cd matrix-bridge-feishu
+   cargo build --release
+   ```
+
+2. **Generate configuration:**
+   ```bash
+   ./target/release/matrix-bridge-feishu --generate-config > config.yaml
+   ```
+
+3. **Configure your bridge:**
+   Edit `config.yaml` with your Matrix and Feishu settings:
+   ```yaml
+   # Matrix homeserver
+   homeserver:
+     address: "http://localhost:8008"
+     domain: "localhost"
+   
+   # Feishu app credentials
+   bridge:
+     app_id: "your_feishu_app_id"
+     app_secret: "your_feishu_app_secret"
+     event_mode: "long_connection"
+     long_connection_domain: "https://open.feishu.cn"
+   ```
+
+4. **Generate registration:**
+   ```bash
+   # Create Matrix appservice registration
+   curl -X PUT -H "Authorization: Bearer <admin-token>" \
+        -d @registration.yaml \
+        "http://localhost:8008/_synapse/admin/v1/registration"
+   ```
+
+5. **Start the bridge:**
+   ```bash
+   ./target/release/matrix-bridge-feishu -c config.yaml
+   ```
+
+## Configuration
+
+### Key Configuration Options
+
+- **Homeserver Settings**: Matrix server connection details
+- **Appservice Settings**: HTTP server and database configuration
+- **Bridge Settings**: Feishu credentials and event subscription mode (`long_connection`/`webhook`)
+- **Callback Security Settings (Webhook Mode)**: `listen_secret`, optional `encrypt_key` and `verification_token`
+- **Permissions**: User permissions and access control
+- **Message Settings**: Formatting and media handling options
+- **Message Policy Controls**: Per-room rate limit, blocked msgtypes, text-size policy, failure degrade template
+- **User Identity Sync**: `user_sync_interval_secs` refresh cadence and `user_mapping_stale_ttl_hours` cleanup TTL
+
+### Environment Variables
+
+You can override configuration with environment variables:
+```bash
+export CONFIG_PATH="/etc/matrix-bridge-feishu/config.yaml"
+export MATRIX_BRIDGE_FEISHU_DB_TYPE="sqlite"
+export MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET="real-secret"
+export MATRIX_BRIDGE_FEISHU_DB_URI="sqlite:matrix-feishu.db"
+export MATRIX_BRIDGE_FEISHU_AS_TOKEN="real_as_token"
+export MATRIX_BRIDGE_FEISHU_BRIDGE_EVENT_MODE="long_connection"
+export MATRIX_BRIDGE_FEISHU_BRIDGE_LONG_CONNECTION_DOMAIN="https://open.feishu.cn"
+```
+
+## Feishu Setup
+
+1. **Create Feishu App:**
+   - Go to Feishu Open Platform
+   - Create a new application
+   - Get App ID and App Secret
+
+2. **Configure Event Subscription (Recommended: Long Connection):**
+   - In Feishu Open Platform, choose long-connection mode for event subscription
+   - No public Request URL is required in this mode
+   - Keep required events subscribed (for example `im.message.receive_v1`, `im.message.recalled_v1`, chat member/chat lifecycle events)
+
+3. **Optional Webhook Compatibility Mode:**
+   - Set `bridge.event_mode: "webhook"`
+   - Set webhook URL to `http://your-server:8081/webhook`
+   - Configure callback verification (`listen_secret`, optional `encrypt_key` + `verification_token`)
+
+4. **Set Permissions:**
+   - Message sending and receiving
+   - User information access
+   - File upload permissions
+   - Rich text and card permissions
+
+5. **Encryption (Optional, Webhook Mode):**
+   - Configure encryption key for secure callback messages
+   - Set verification token for additional security
+
+## Setup in Matrix Room
+
+After the bridge process is running, bind a Matrix room to a Feishu chat from inside Matrix:
+
+1. Create (or choose) a Matrix room on your homeserver.
+2. Invite the bridge bot user to that room:
+   - Format: `@<appservice.bot.username>:<homeserver.domain>`
+   - Example: `@feishubot:localhost`
+3. In that room, run:
+   - `!feishu help` to check command availability
+   - `!feishu bridge <feishu_chat_id>` to bind the room
+4. Verify mapping:
+   - `./target/release/matrix-bridge-feishu -c config.yaml mappings`
+   - or query `GET /admin/mappings`
+5. To remove mapping later:
+   - `!feishu unbridge`
+
+Notes:
+- Command prefix is `!feishu`.
+- Typical Feishu chat ids look like `oc_xxxxxxx`.
+
+## API Endpoints
+
+### Matrix Appservice API
+- `/_matrix/app/*` - Matrix appservice endpoints
+- `/health` - Health check endpoint
+- `/metrics` - Prometheus metrics endpoint
+
+### Feishu Event Inbound
+- Long-connection mode: no public inbound endpoint required
+- Webhook mode only: `/webhook` receives callback events from Feishu
+
+### Provisioning Security
+
+Provisioning endpoints require bearer token authentication:
+
+```bash
+Authorization: Bearer <token>
+```
+
+- Read endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN`.
+- Write endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN`.
+- Delete/high-risk endpoints can use `MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN`.
+- Backward compatibility: `MATRIX_BRIDGE_FEISHU_PROVISIONING_TOKEN` and `MATRIX_BRIDGE_FEISHU_PROVISIONING_ADMIN_TOKEN` still work as fallbacks.
+
+### Provisioning/Ops Endpoints
+
+- `GET /admin/status` - bridge runtime status and dead-letter counters
+- `GET /admin/mappings` - list active Matrix/Feishu mappings
+- `POST /admin/dead-letters/replay` - batch replay dead-letters by status/limit
+- `POST /admin/dead-letters/cleanup` - cleanup dead-letters by status/time window
+
+### Ops CLI Commands
+
+```bash
+./target/release/matrix-bridge-feishu -c config.yaml status
+./target/release/matrix-bridge-feishu -c config.yaml mappings --limit 50 --offset 0
+./target/release/matrix-bridge-feishu -c config.yaml replay --id 123
+./target/release/matrix-bridge-feishu -c config.yaml replay --status pending --limit 20
+./target/release/matrix-bridge-feishu -c config.yaml dead-letter-cleanup --status replayed --older-than-hours 72 --limit 500 --dry-run
+```
+
+Use `--admin-api http://host:port/admin` and `--token <provisioning_token>` to target remote instances.
+
+## Database
+
+The bridge currently uses SQLite for bridge store persistence.
+
+### Migrations
+
+Database migrations are applied automatically on startup.
+
+## Development
+
+### Building
+
+```bash
+# Debug build
+cargo build
+
+# Release build
+cargo build --release
+
+# Run tests
+cargo test
+
+# Check formatting
+cargo fmt --check
+
+# Run clippy
+cargo clippy
+```
+
+### Project Structure
+
+```
+src/
+├── main.rs              # Application entry point
+├── config/              # Configuration handling
+├── database/            # Database layer and migrations
+├── feishu/              # Feishu API integration
+├── bridge/              # Core bridge logic
+├── formatter/           # Message format conversion
+└── util/                # Utility functions
+```
+
+### Adding Features
+
+1. Add platform integration in `feishu/`
+2. Update message formatters in `formatter/`
+3. Add database migrations if needed
+4. Update configuration options
+
+## Deployment
+
+### Docker
+
+```dockerfile
+FROM rust:1.93 as builder
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates
+COPY --from=builder /app/target/release/matrix-bridge-feishu /usr/local/bin/
+EXPOSE 8080
+CMD ["matrix-bridge-feishu", "-c", "/config/config.yaml"]
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  matrix-bridge-feishu:
+    build: .
+    ports:
+      - "8080:8080"
+      # add only when bridge.event_mode=webhook
+      # - "8081:8081"
+    volumes:
+      - ./config.yaml:/config/config.yaml
+      - ./data:/data
+    environment:
+      - RUST_LOG=info
+```
+
+### Systemd
+
+```ini
+[Unit]
+Description=Matrix Appservice Feishu
+After=network.target
+
+[Service]
+Type=simple
+User=matrix
+ExecStart=/usr/local/bin/matrix-bridge-feishu -c /etc/matrix-bridge-feishu/config.yaml
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Production Deployment Template
+
+Recommended host layout:
+
+```text
+/opt/matrix-bridge-feishu/
+  bin/matrix-bridge-feishu
+  config/config.yaml
+  data/matrix-feishu.db
+  logs/
+```
+
+Recommended environment variables (service-level):
+
+```bash
+CONFIG_PATH=/opt/matrix-bridge-feishu/config/config.yaml
+MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN=<read-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_WRITE_TOKEN=<write-token>
+MATRIX_BRIDGE_FEISHU_PROVISIONING_DELETE_TOKEN=<delete-token>
+FEISHU_API_MAX_RETRIES=2
+FEISHU_API_RETRY_BASE_MS=250
+RUST_LOG=info
+```
+
+Pre-deploy gate:
+
+```powershell
+pwsh ./scripts/release-check.ps1 `
+  -ConfigPath ./config.yaml `
+  -SubscribedEvents "im.message.receive_v1,im.message.recalled_v1,im.chat.member.user.added_v1,im.chat.member.user.deleted_v1,im.chat.updated_v1,im.chat.disbanded_v1"
+```
+
+## Monitoring
+
+### Health Checks
+
+- HTTP health endpoint at `/health`
+- Prometheus metrics endpoint at `/metrics`
+- Process monitoring with systemd or Docker
+- Database connection monitoring
+
+### Logging
+
+The bridge uses structured logging with `tracing`:
+```bash
+# Set log level
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
+
+# Log to file
+RUST_LOG=info ./matrix-bridge-feishu -c config.yaml > bridge.log
+```
+
+### Stress Testing
+
+Use built-in scripts to evaluate webhook burst handling and queue stability (webhook mode only):
+
+```powershell
+pwsh ./scripts/stress-webhook.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+
+pwsh ./scripts/stress-batch-messages.ps1 `
+  -WebhookUrl http://127.0.0.1:38081/webhook `
+  -MetricsUrl http://127.0.0.1:8080/metrics `
+  -VerificationToken <token> `
+  -SigningSecret <listen_secret>
+```
+
+Capacity boundary rule used by both scripts:
+- `error_rate <= 1%`
+- `p95 latency <= 1500ms`
+- `bridge_queue_depth_max` should not grow faster than load (`delta <= concurrency*2` in webhook ramp mode)
+
+Recommended starting production parameters (adjust from script output):
+- Concurrency: `70%` of measured stable max concurrency
+- Retry: `FEISHU_API_MAX_RETRIES=2`, `FEISHU_API_RETRY_BASE_MS=250` (raise base delay to `500ms` near boundary)
+- Timeout: `bridge.webhook_timeout = max(30s, ceil(p99*3))`, `bridge.api_timeout = max(60s, ceil(p99*4))`
+
+## Troubleshooting
+
+### Common Issues
+
+1. **Connection Failed**: Check network and firewall settings
+2. **Authentication Error**: Verify Feishu app credentials
+3. **Database Error**: Check database connection and permissions
+4. **Message Not Bridged**: Check long-connection logs/state, or webhook configuration if running in webhook mode
+5. **Encryption Error**: Verify webhook encryption key and verification token (webhook mode)
+
+### 10-Min Triage Flow
+
+1. Check liveness and auth: `/health`, `/admin/status`, `/admin/mappings`.
+2. Check queue pressure: `bridge_queue_depth`, `bridge_queue_depth_max`, `bridge_processing_duration_ms_*`.
+3. Check delivery failures: `bridge_outbound_failures_total_by_api_code` and recent logs with `trace_id`.
+4. Check dead letters: `/admin/dead-letters?status=pending` and replay a single sample.
+5. Run deep release checks: `release-check.ps1` without skip flags.
+
+### Common Error Map
+
+| Signal | Meaning | Action |
+|---|---|---|
+| HTTP `401` / `403` from Feishu API | credential/scope issue | verify `app_id/app_secret`, app scopes, tenant install state |
+| HTTP `429` or Feishu code `99991663`/`90013` | rate limited | reduce concurrency, increase retry backoff (`FEISHU_API_RETRY_BASE_MS`) |
+| Feishu token-related message (`tenant_access_token invalid`) | auth token invalid/expired | rotate app secret, re-check app credentials and server clock |
+| Webhook `invalid signature` / `missing signature` (webhook mode) | callback signing mismatch | verify `listen_secret`, `X-Lark-*` headers, reverse proxy pass-through |
+| SQLite `quick_check` not `ok` | db integrity risk | stop service and restore latest db backup |
+
+### Rollback Procedure
+
+1. Stop service (`systemctl stop matrix-bridge-feishu`).
+2. Backup current DB before rollback:
+   ```bash
+   sqlite3 /opt/matrix-bridge-feishu/data/matrix-feishu.db ".backup '/opt/matrix-bridge-feishu/data/matrix-feishu.db.pre_rollback'"
+   ```
+3. Restore previous binary and config (`bin/` + `config/`).
+4. If schema/data regressed, restore last known-good DB snapshot.
+5. Start service and verify:
+   - `/health` is `200`
+   - `/admin/status` is `running`
+   - no spike in `bridge_outbound_failures_total`
+6. Replay pending dead letters after stability is confirmed.
+
+### Focused Playbook
+
+- **Webhook signature failed (webhook mode)**: verify `bridge.listen_secret` and request headers `X-Lark-Request-Timestamp`, `X-Lark-Request-Nonce`, `X-Lark-Signature`.
+- **Permission denied on send**: check Feishu app scopes for message send/read and file/image APIs.
+- **Rate limit spikes**: monitor `/metrics` fields `bridge_outbound_failures_total_by_api_code` and tune retry env vars `FEISHU_API_MAX_RETRIES` / `FEISHU_API_RETRY_BASE_MS`.
+- **Policy drops / degraded send path**: monitor `/metrics` fields `bridge_policy_blocked_total_by_reason` and `bridge_degraded_events_total_by_reason`.
+- **End-to-end traceability**: monitor `bridge_trace_events_total_by_flow_status` and search logs by `trace_id` with `matrix_event_id` or `feishu_message_id`.
+
+### Debug Mode
+
+Enable debug logging:
+```bash
+RUST_LOG=debug ./matrix-bridge-feishu -c config.yaml
+```
+
+## Security
+
+- **Token Security**: Store secrets securely (environment variables, secret management)
+- **Encryption**: Enable callback encryption when using webhook mode
+- **Network Security**: Use HTTPS in production
+- **Access Control**: Configure proper permissions in Matrix
+
+## Feishu Features
+
+### Rich Text Support
+
+The bridge supports Feishu's rich text format:
+- Text formatting (bold, italic, underline)
+- Mentions (@user)
+- Links
+- Inline images
+
+### Card Messages
+
+Feishu card messages are converted to Matrix messages:
+- Interactive cards to formatted text
+- Button actions as text links
+- Image cards to Matrix images
+
+### File Handling
+
+- Automatic file upload and download
+- Media conversion when needed
+- File size limits and restrictions
+
+## Message Types
+
+### Matrix to Feishu
+- `m.text` → Feishu text message
+- `m.notice` → Feishu notice
+- `m.image` → Feishu image message
+- `m.file` → Feishu file message
+- `m.audio` → Feishu audio message
+- `m.video` → Feishu video message
+
+### Feishu to Matrix
+- Text → `m.text`
+- Rich text → Formatted `m.text`
+- Image → `m.image`
+- File → `m.file`
+- Audio → `m.audio`
+- Video → `m.video`
+- Card → Formatted `m.text`
+
+## Capability Matrix
+
+### Feishu Message Types
+
+| `msg_type` | Status | Degrade Strategy | Code Entry |
+|---|---|---|---|
+| `text` | Supported | Plain text passthrough | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+| `post` | Supported | Flatten rich blocks/mentions/links into readable Matrix text | `src/feishu/service.rs:extract_text_from_post_content` |
+| `interactive` / `card` | Partial | Extract header + key elements/actions text | `src/feishu/service.rs:extract_text_from_card_content` |
+| `image` / `file` / `audio` / `media` / `sticker` | Supported | Bridge as attachments, fallback placeholder text when needed | `src/feishu/service.rs:webhook_event_to_bridge_message` |
+
+### Feishu Event Types
+
+| `event_type` | Status | Degrade Strategy | Code Entry |
+|---|---|---|---|
+| `im.message.receive_v1` | Supported | Unknown message type falls back to text | `src/feishu/service.rs:dispatch_event_payload` |
+| `im.message.recalled_v1` | Supported | Missing mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_message_recalled` |
+| `im.chat.member.user.added_v1` | Supported | Missing room mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_added` |
+| `im.chat.member.user.deleted_v1` | Supported | Missing room mapping logs and skips | `src/bridge/feishu_bridge.rs:handle_feishu_chat_member_deleted` |
+| `im.chat.updated_v1` | Supported | Partial field patch to existing mapping | `src/bridge/feishu_bridge.rs:handle_feishu_chat_updated` |
+| `im.chat.disbanded_v1` | Supported | Missing mapping only clears memory cache | `src/bridge/feishu_bridge.rs:handle_feishu_chat_disbanded` |
+
+### Bridge Reliability
+
+| Capability | Status | Notes |
+|---|---|---|
+| Matrix reply/edit/redaction | Supported | Routed to Feishu reply/update/delete APIs |
+| Thread/topic mapping | Supported | Stores and bridges `thread_id/root_id/parent_id` |
+| Dead-letter + replay | Supported | Failed Feishu event tasks can be listed/replayed via provisioning API |
+| Media dedupe cache | Supported | Reused Feishu uploaded key by content hash |
+| PostgreSQL/MySQL stores | Not supported | Bridge stores are intentionally SQLite-only in current build |
+
+## Required Feishu Setup
+
+1. Create a self-built Feishu app and install it to target chats.
+2. Grant scopes for message send/receive, message resource read, image/file upload.
+3. Configure event subscriptions: receive, recalled, chat member added/deleted, chat updated/disbanded.
+4. Use long-connection mode (`bridge.event_mode=long_connection`, default).
+5. If webhook mode is used, configure callback security: `listen_secret` and optionally `encrypt_key + verification_token`.
+
+## Release Check Script
+
+Use the built-in pre-release checker:
+
+```powershell
+pwsh ./scripts/release-check.ps1 -ConfigPath ./config.yaml
+pwsh ./scripts/release-check.ps1 `
+  -ConfigPath ./config.yaml `
+  -SubscribedEvents "im.message.receive_v1,im.message.recalled_v1,im.chat.member.user.added_v1,im.chat.member.user.deleted_v1,im.chat.updated_v1,im.chat.disbanded_v1" `
+  -ScopeProbeChatId <chat_id> `
+  -ScopeProbeUserId <user_id>
+```
+
+Coverage now includes four risk classes:
+- Config consistency: URL/db/token/encryption consistency checks
+- Permission checks: read/write/delete provisioning token scope verification
+- Event subscription checks: required Feishu event list validation
+- Data health checks: SQLite quick check + required key table existence/counters
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Add tests
+5. Submit a pull request
+
+### Code Style
+
+- Use `rustfmt` for code formatting
+- Use `clippy` for linting
+- Add proper documentation
+- Include error handling
+
+## License
+
+This project is licensed under the AGPL-3.0 License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- **Issues**: Report bugs and feature requests on GitHub
+- **Discussions**: Community discussions and Q&A
+- **Documentation**: Check the wiki for detailed guides
+
+## Acknowledgments
+
+- Inspired by matrix-appservice-discord and matrix-appservice-wechat
+- Built with Salvo web framework
+- Uses Diesel for database operations
+- Feishu Open Platform API documentation
