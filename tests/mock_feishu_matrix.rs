@@ -8,7 +8,7 @@ use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sqlite::SqliteConnection;
 use matrix_bridge_feishu::bridge::{MatrixEvent, MatrixEventProcessor, MessageFlow};
 use matrix_bridge_feishu::config::{
-    BridgeConfig, Config, DatabaseConfig, LoggingConfig, LoggingWriterConfig,
+    BridgeConfig, Config, DatabaseConfig, LoggingConfig, LoggingWriterConfig, RegistrationConfig,
 };
 use matrix_bridge_feishu::database::sqlite_stores::SqliteStores;
 use matrix_bridge_feishu::database::{Database, MessageMapping, RoomMapping};
@@ -462,7 +462,8 @@ async fn matrix_to_feishu_media_oversize_fails_without_degrade() {
     let result = processor.process_event(oversize_event).await;
     assert!(
         result.is_ok(),
-        "oversize media should be tolerated without crashing pipeline"
+        "oversize media should be tolerated without crashing pipeline: {:?}",
+        result
     );
     assert!(
         feishu_state.create_calls.load(Ordering::Relaxed) >= 1,
@@ -503,9 +504,6 @@ fn build_test_config(matrix_base: &str, db_uri: &str) -> Config {
             homeserver_url: matrix_base.to_string(),
             port: 39080,
             bind_address: "127.0.0.1".to_string(),
-            id: "feishu-test".to_string(),
-            as_token: "as_token_test_value".to_string(),
-            hs_token: "hs_token_test_value".to_string(),
             bot_username: "feishubot".to_string(),
             bot_displayname: "Feishu Test Bot".to_string(),
             bot_avatar: "mxc://localhost/feishubot".to_string(),
@@ -571,6 +569,13 @@ fn build_test_config(matrix_base: &str, db_uri: &str) -> Config {
             max_conn_idle_time: None,
             max_conn_lifetime: None,
         },
+        registration: RegistrationConfig {
+            id: "feishu-test".to_string(),
+            as_token: "as_token_test_value".to_string(),
+            hs_token: "hs_token_test_value".to_string(),
+            sender_localpart: "feishubot".to_string(),
+            ..RegistrationConfig::default()
+        },
     }
 }
 
@@ -580,10 +585,8 @@ async fn start_feishu_mock(state: FeishuMockState) -> (String, tokio::task::Join
         res.render(Json(json!({
             "code": 0,
             "msg": "ok",
-            "data": {
-                "tenant_access_token": "mock_token",
-                "expire": 7200
-            }
+            "tenant_access_token": "mock_token",
+            "expire": 7200
         })));
     }
 
