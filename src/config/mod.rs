@@ -110,8 +110,17 @@ pub struct Config {
     pub bridge: BridgeConfig,
     pub logging: LoggingConfig,
     pub database: DatabaseConfig,
-    #[serde(skip)]
+    #[serde(default)]
     pub registration: RegistrationConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileConfig {
+    bridge: BridgeConfig,
+    logging: LoggingConfig,
+    database: DatabaseConfig,
+    #[serde(default)]
+    registration: Option<RegistrationConfig>,
 }
 
 impl Config {
@@ -127,20 +136,20 @@ impl Config {
 
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let content = std::fs::read_to_string(&path)?;
-        let mut config: Config = serde_yaml::from_str(&content)?;
+        let file_config: FileConfig = serde_yaml::from_str(&content)?;
 
         let config_dir = path.as_ref().parent().unwrap_or(Path::new("."));
-        let registration_path = config_dir
-            .join("appservices")
-            .join("feishu-registration.yaml");
-        let registration_content = std::fs::read_to_string(&registration_path).map_err(|e| {
-            ConfigError::InvalidConfig(format!(
-                "failed to load registration file {}: {}",
-                registration_path.display(),
-                e
-            ))
-        })?;
-        config.registration = serde_yaml::from_str(&registration_content)?;
+        let registration = match file_config.registration {
+            Some(registration) => registration,
+            None => Self::load_registration_from_fallback_file(config_dir)?,
+        };
+
+        let mut config = Config {
+            bridge: file_config.bridge,
+            logging: file_config.logging,
+            database: file_config.database,
+            registration,
+        };
 
         config.apply_env_overrides();
         config.normalize();
@@ -149,12 +158,44 @@ impl Config {
     }
 
     pub fn load_from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let mut config: Config = serde_yaml::from_slice(bytes)?;
-        config.registration = RegistrationConfig::default();
+        let file_config: FileConfig = serde_yaml::from_slice(bytes)?;
+        let mut config = Config {
+            bridge: file_config.bridge,
+            logging: file_config.logging,
+            database: file_config.database,
+            registration: file_config.registration.unwrap_or_default(),
+        };
         config.apply_env_overrides();
         config.normalize();
         config.validate()?;
         Ok(config)
+    }
+
+    fn load_registration_from_fallback_file(config_dir: &Path) -> Result<RegistrationConfig, ConfigError> {
+        let primary = config_dir.join("feishu-registration.yaml");
+        let legacy = config_dir
+            .join("appservices")
+            .join("feishu-registration.yaml");
+
+        for registration_path in [&primary, &legacy] {
+            match std::fs::read_to_string(registration_path) {
+                Ok(content) => return Ok(serde_yaml::from_str(&content)?),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(ConfigError::InvalidConfig(format!(
+                        "failed to load registration file {}: {}",
+                        registration_path.display(),
+                        e
+                    )));
+                }
+            }
+        }
+
+        Err(ConfigError::InvalidConfig(format!(
+            "registration is missing in config file and fallback files do not exist: {}, {}",
+            primary.display(),
+            legacy.display()
+        )))
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
