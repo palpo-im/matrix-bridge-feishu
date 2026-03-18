@@ -51,13 +51,27 @@ The bridge is built with a modular architecture:
    ```
 
 3. **Configure your bridge:**
-   Edit `config.yaml` with your Matrix and Feishu settings:
+   Edit `config.yaml` (or `config.kdl` for KDL format) with your Matrix and Feishu settings:
+
+   KDL format (`config.kdl`):
+   ```kdl
+   bridge {
+       domain "localhost"
+       homeserver_url "http://localhost:8008"
+       app_id "your_feishu_app_id"
+       app_secret "your_feishu_app_secret"
+       event_mode "long_connection"
+       long_connection_domain "https://open.feishu.cn"
+   }
+   ```
+
+   YAML format (`config.yaml`):
    ```yaml
    # Matrix homeserver
    homeserver:
      address: "http://localhost:8008"
      domain: "localhost"
-   
+
    # Feishu app credentials
    bridge:
      app_id: "your_feishu_app_id"
@@ -91,6 +105,35 @@ The bridge is built with a modular architecture:
 - **Message Settings**: Formatting and media handling options
 - **Message Policy Controls**: Per-room rate limit, blocked msgtypes, text-size policy, failure degrade template
 - **User Identity Sync**: `user_sync_interval_secs` refresh cadence and `user_mapping_stale_ttl_hours` cleanup TTL
+
+### Palpo KDL Configuration
+
+When running with Palpo, configure `palpo.kdl`:
+
+```kdl
+server_name "example.com"
+appservice_registration_dir "appservices"
+```
+
+And create the bridge config as `config.kdl`:
+
+```kdl
+bridge {
+    domain "example.com"
+    homeserver_url "http://127.0.0.1:6006"
+    port 8080
+    app_id "your_feishu_app_id"
+    app_secret "your_feishu_app_secret"
+    event_mode "long_connection"
+}
+
+database {
+    type "sqlite"
+    uri "sqlite:matrix-feishu.db"
+}
+```
+
+See `config/config.example.kdl` for a complete KDL configuration reference.
 
 ### Environment Variables
 

@@ -58,6 +58,7 @@ matrix-bot-sdk = "0.2.4"
 parking_lot = "0.12"
 lru = "0.16.3"
 feishu-sdk = "0.1.0"
+kdl = "4"
 
 [profile.release]
 lto = true

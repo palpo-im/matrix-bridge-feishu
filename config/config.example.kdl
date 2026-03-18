@@ -1,0 +1,149 @@
+// Matrix-Feishu Bridge Configuration (KDL format)
+//
+// Environment override examples:
+// - CONFIG_PATH
+// - MATRIX_BRIDGE_FEISHU_DB_TYPE / MATRIX_BRIDGE_FEISHU_DB_URI
+// - MATRIX_BRIDGE_FEISHU_AS_TOKEN / MATRIX_BRIDGE_FEISHU_HS_TOKEN
+// - MATRIX_BRIDGE_FEISHU_BRIDGE_APP_ID / MATRIX_BRIDGE_FEISHU_BRIDGE_APP_SECRET
+// - MATRIX_BRIDGE_FEISHU_PROVISIONING_READ_TOKEN / WRITE_TOKEN / DELETE_TOKEN
+// - FEISHU_API_MAX_RETRIES / FEISHU_API_RETRY_BASE_MS
+//
+// Production baseline recommendations:
+// - Use an absolute SQLite path on persistent storage (example below).
+// - Keep webhook/api timeouts at or above stress-script recommendations.
+// - Backup SQLite before every upgrade/rollback window.
+
+bridge {
+    // Domain part of the bridge, e.g. matrix.org
+    domain "127.0.0.1:6006"
+    // This should be your publicly-facing URL because Feishu may use it to
+    // fetch media from the media store.
+    homeserver_url "http://127.0.0.1:6006"
+    // The TCP port on which the appservice runs on.
+    port 8080
+    // Bind address for the appservice
+    bind_address "0.0.0.0"
+
+    // Event subscription mode: long_connection (recommended) or webhook
+    event_mode "long_connection"
+    // The address where Feishu webhooks will be received (used only in webhook mode)
+    listen_address "http://0.0.0.0:8081"
+    // The secret for validating Feishu webhooks (used only in webhook mode)
+    listen_secret ""
+    // Feishu long-connection endpoint domain
+    long_connection_domain "https://open.feishu.cn"
+    // Reconnect interval for long connection (seconds)
+    long_connection_reconnect_interval_secs 5
+
+    // Feishu app credentials
+    app_id "feishu_app_id"
+    app_secret "feishu_app_secret"
+    // Optional: Feishu encrypt key
+    encrypt_key null
+    // Optional: Feishu verification token
+    verification_token null
+
+    // Bot configuration
+    bot_username "_feishu_bot"
+    bot_displayname "Feishu Bridge"
+    bot_avatar "mxc://127.0.0.1:6006/feishu-avatar"
+
+    // Username template for bridged users
+    username_template "feishu_{{.}}"
+    // Displayname template for bridged users
+    displayname_template "{{.}} (Feishu)"
+    // Avatar URL template for bridged users
+    avatar_template ""
+
+    // Bridge Matrix replies
+    bridge_matrix_reply true
+    // Bridge Matrix edits
+    bridge_matrix_edit true
+    // Bridge Matrix reactions
+    bridge_matrix_reactions true
+    // Bridge Matrix redactions
+    bridge_matrix_redactions true
+    // Bridge Matrix leaves
+    bridge_matrix_leave true
+    // Bridge Feishu joins
+    bridge_feishu_join true
+    // Bridge Feishu leaves
+    bridge_feishu_leave true
+
+    // Allow plain text messages
+    allow_plain_text true
+    // Allow markdown messages
+    allow_markdown true
+    // Allow HTML messages
+    allow_html false
+    // Allow images
+    allow_images true
+    // Allow videos
+    allow_videos true
+    // Allow audio
+    allow_audio true
+    // Allow files
+    allow_files true
+    // Maximum media size in bytes (10MB)
+    max_media_size 10485760
+    // Message limit per minute
+    message_limit 60
+    // Message cooldown in milliseconds
+    message_cooldown 1000
+    // Block specific Matrix msgtypes from outbound bridge (e.g. "m.sticker")
+    blocked_matrix_msgtypes {
+    }
+    // Maximum outbound text length (0 disables truncation policy)
+    max_text_length 0
+    // Enable degrade notice when outbound delivery fails
+    enable_failure_degrade true
+    // Degrade template variables: {matrix_event_id}, {matrix_room_id}, {error}
+    failure_notice_template "[bridge degraded] failed to deliver message from Matrix event {matrix_event_id}: {error}"
+    // User profile sync interval in seconds
+    user_sync_interval_secs 300
+    // Remove stale user mappings older than this TTL in hours
+    user_mapping_stale_ttl_hours 720
+    // Webhook timeout in seconds
+    // Recommended: max(30, ceil(p99_ms * 3 / 1000)) from stress test output
+    webhook_timeout 30
+    // Feishu API timeout in seconds
+    // Recommended: max(60, ceil(p99_ms * 4 / 1000)) from stress test output
+    api_timeout 60
+    // Enable Feishu rich text formatting
+    enable_rich_text true
+    // Convert Feishu cards to Matrix
+    convert_cards true
+
+    // Permissions
+    permissions {
+        "*" "relay"
+        "127.0.0.1:6006" "full"
+        "@admin:127.0.0.1:6006" "admin"
+    }
+}
+
+// Logging configuration
+logging {
+    // Minimum log level (trace, debug, info, warn, error)
+    min_level "info"
+    // Log writers
+    writers {
+        - type="stdout" format="pretty"
+    }
+}
+
+// Database configuration
+database {
+    // Database type (currently only sqlite is supported by bridge stores)
+    type "sqlite"
+    // Database connection URI (production example: sqlite:/var/lib/matrix-bridge-feishu/matrix-feishu.db)
+    uri "sqlite:temp/data/matrix-feishu.db"
+    // Maximum open connections
+    max_open_conns 20
+    // Maximum idle connections
+    max_idle_conns 2
+    // Maximum connection idle time
+    max_conn_idle_time null
+    // Maximum connection lifetime
+    max_conn_lifetime null
+}
