@@ -162,7 +162,7 @@ fn kdl_value_to_json(value: &kdl::KdlValue) -> Value {
         | kdl::KdlValue::Base8(i)
         | kdl::KdlValue::Base10(i)
         | kdl::KdlValue::Base16(i) => Value::Number((*i).into()),
-        kdl::KdlValue::Float(f) => serde_json::Number::from_f64(*f)
+        kdl::KdlValue::Base10Float(f) => serde_json::Number::from_f64(*f)
             .map(Value::Number)
             .unwrap_or(Value::Null),
         kdl::KdlValue::Bool(b) => Value::Bool(*b),
